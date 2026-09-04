@@ -4,8 +4,8 @@ A FastAPI service that scores credit-card transactions for fraud in real time,
 serving an XGBoost model exported to ONNX. Sustains **~4,100 single-transaction
 predictions per second at a p99 of 6.7 ms** on a 2020 M1 MacBook Air.
 
-**Status: Phase 1 complete** (model + API). Phase 2 (Docker) and Phase 3 (AWS
-ECS Fargate deployment) are not built yet — see [Project status](#project-status).
+**Status: Phases 1–2 complete** (model + API + Docker). Phase 3 (AWS ECS
+Fargate deployment) is not built yet — see [Project status](#project-status).
 
 ---
 
@@ -179,6 +179,111 @@ throughput by 6x. `benchmark.py` therefore spreads load across multiple client
 
 ---
 
+## Docker
+
+```bash
+docker build -t fraud-api .          # runtime image (default target)
+docker run -p 8000:8000 fraud-api
+```
+
+Multi-stage build, non-root (`uid 10001`), `HEALTHCHECK` on `/health`, and
+`WORKERS` tunable at container start without a rebuild.
+
+### The dependency split, measured
+
+| image | size | packages |
+|---|---|---|
+| **`fraud-api` (multi-stage, runtime deps)** | **382 MB** | **25** |
+| naive single-stage with the training stack | 1.05 GB | 48 |
+
+**668 MB smaller — a 64% reduction.** Nothing about the model changes; the
+training stack simply never enters the image, because ONNX Runtime executes the
+serialized graph on its own. Verified directly:
+
+```console
+$ docker run --rm fraud-api pip list | grep -Ei 'scikit|xgboost|pandas'
+$ echo $?
+1        # no matches — the training stack is not in the shipped image
+```
+
+### Dropping sympy: 74 MB, verified not assumed
+
+`onnxruntime` depends on `sympy`, which is larger than onnxruntime itself —
+about 30% of the virtualenv. It is used for *symbolic shape inference*, a
+model-authoring and optimization tool, not for executing a session.
+
+Measured by building each variant, rather than attributed by guesswork:
+
+| build | size |
+|---|---|
+| multi-stage, as pip resolves it | 528 MB |
+| − `sympy` + `mpmath` | 425 MB (**−103 MB**) |
+| − install-time bytecode caches | **382 MB** (−43 MB) |
+
+That is what brings it under the 400 MB target; the dependency split alone
+lands at 528 MB.
+
+That claim was checked rather than assumed. `sympy` is absent from
+`sys.modules` after importing `onnxruntime`, after creating the
+`InferenceSession`, **and** after running inference — and the full test suite
+passes inside the image without it.
+
+The honest trade-off: `onnxruntime` still *declares* the dependency, so
+`pip check` will report the metadata as inconsistent. The `test` build stage is
+what keeps that safe — if any ORT path the service actually uses ever needs
+sympy, the **build** fails rather than the container failing in production.
+
+### Testing the artifact that ships
+
+The `test` stage derives `FROM` the runtime layers and adds only pytest and the
+test files, so the interpreter, model and application code under test are
+byte-for-byte those in the shipped image — and the test files never reach it.
+
+```bash
+docker build --target test .    # 31 passed; a failure fails the build
+```
+
+This exists to close a specific gap: local builds are native **arm64** for
+fast iteration, but Fargate is **x86_64** and the `linux/amd64` image is only
+ever built on CI's x86 runners. Testing it there is what keeps the split from
+being a "works on my machine" trap. `runtime` is deliberately the **last**
+stage, so a plain `docker build .` cannot accidentally ship the test stage.
+
+### `exec` in the CMD is load-bearing
+
+```dockerfile
+CMD exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${WORKERS:-2}
+```
+
+Shell form is needed to expand `${WORKERS}` at start time, but without `exec`
+the shell stays PID 1 and uvicorn runs as its child — so the SIGTERM that ECS
+sends to stop a task lands on `/bin/sh` and is never forwarded. The container
+would ignore the shutdown, wait out the stop timeout, get SIGKILLed, and drop
+in-flight requests on **every deploy and every scale-in**. With `exec`, uvicorn
+is PID 1:
+
+```console
+$ docker stop fraud-api
+stopped in 747 ms          # not 10s+
+INFO:  Application shutdown complete.
+```
+
+### Container performance
+
+| mode | container | native | |
+|---|---|---|---|
+| single (1 txn/request) | 3,108 pred/s, p99 10.2 ms | 4,120 pred/s, p99 6.7 ms | 75% |
+| batch (500 txns/request) | 66,752 pred/s | 62,544 pred/s | 107% |
+
+The single-request gap is **Docker Desktop on macOS, not the image**: containers
+run inside a Linux VM, so every port-forwarded request crosses the VM boundary.
+That per-request cost dominates single mode (many small requests) and is
+negligible in batch mode (few large ones) — which is exactly the pattern above,
+and why batch is marginally *faster* in the container. On Linux hosts and on
+Fargate there is no such boundary.
+
+---
+
 ## Reproducing
 
 ```bash
@@ -258,7 +363,7 @@ asserted as three things instead:
 
 - [x] **Phase 1 — Model + FastAPI.** Training, tuning, ONNX export, API, 31
       tests, benchmark.
-- [ ] **Phase 2 — Docker.** Multi-stage build, target < 400 MB.
+- [x] **Phase 2 — Docker.** Multi-stage build, 382 MB, in-image test stage.
 - [ ] **Phase 3 — AWS.** Terraform, ECS Fargate across 2 AZs behind an ALB,
       target-tracking autoscaling, GitHub Actions OIDC deploy.
 
@@ -277,5 +382,7 @@ do not support that claim on their own.
 ├── tests/                  # 31 tests, runtime deps only
 ├── scripts/benchmark.py    # multi-process load generator
 ├── models/                 # committed: ONNX model, metadata, parity fixture
+├── Dockerfile              # multi-stage: builder / base / test / runtime
+├── .dockerignore
 └── .github/workflows/ci.yml
 ```

@@ -1,0 +1,40 @@
+# Without this file Docker ships the 69MB archive and the 150MB CSV into the
+# build context, and they end up baked into the image.
+data/
+archive.zip
+*.csv
+
+.git/
+.gitignore
+.github/
+
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Docs and planning material -- no reason to invalidate build cache on edits.
+README.md
+full-plan.md
+*.md
+
+.env
+.DS_Store
+.idea/
+.vscode/
+
+# Terraform (Phase 3)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+
+Dockerfile
+.dockerignore
+
+# NOTE: tests/ is deliberately NOT excluded. It never reaches the shipped
+# image -- only the `test` build stage copies it -- but it must be in the build
+# context so that stage can run the suite against the real runtime layers.
+# See the stage comments in the Dockerfile.
