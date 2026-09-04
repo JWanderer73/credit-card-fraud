@@ -1,0 +1,129 @@
+{
+  "model": {
+    "framework": "xgboost",
+    "format": "onnx",
+    "onnx_file": "fraud_model.onnx",
+    "n_estimators": 473,
+    "hyperparameters": {
+      "colsample_bytree": 0.9634805237077472,
+      "gamma": 0.0056005574005474346,
+      "learning_rate": 0.09018835646458206,
+      "max_delta_step": 6,
+      "max_depth": 4,
+      "min_child_weight": 1,
+      "reg_lambda": 1.3173119289852715,
+      "scale_pos_weight": 577.2868020304569,
+      "subsample": 0.7506781447947195
+    }
+  },
+  "features": {
+    "names": [
+      "Time",
+      "V1",
+      "V2",
+      "V3",
+      "V4",
+      "V5",
+      "V6",
+      "V7",
+      "V8",
+      "V9",
+      "V10",
+      "V11",
+      "V12",
+      "V13",
+      "V14",
+      "V15",
+      "V16",
+      "V17",
+      "V18",
+      "V19",
+      "V20",
+      "V21",
+      "V22",
+      "V23",
+      "V24",
+      "V25",
+      "V26",
+      "V27",
+      "V28",
+      "Amount"
+    ],
+    "n_features": 30,
+    "scaled_indices": [
+      0,
+      29
+    ],
+    "note": "Input order is the raw CSV order; scaling is inside the graph."
+  },
+  "threshold": {
+    "value": 0.7564894556999207,
+    "policy": "max_f1_on_pooled_oof",
+    "oof_precision": 0.9277456647398844,
+    "oof_recall": 0.8147208121827412,
+    "oof_f1": 0.8675675675675675
+  },
+  "validation": {
+    "strategy": "StratifiedKFold(n_splits=5, shuffle=True)",
+    "search": {
+      "strategy": "RandomizedSearchCV",
+      "n_candidates": 150,
+      "scoring": "average_precision",
+      "best_cv_score": 0.8550941233789808
+    },
+    "fold_pr_auc": [
+      0.8537289635878651,
+      0.826012592356702,
+      0.8441879373311316,
+      0.900060249082514,
+      0.8514808745366913
+    ],
+    "cv_pr_auc_mean": 0.8550941233789808,
+    "cv_pr_auc_std": 0.024501232744282897,
+    "oof_pr_auc": 0.8546283495854518
+  },
+  "holdout_test": {
+    "note": "Untouched during selection; these are the reportable numbers.",
+    "test_size": 0.2,
+    "n_rows": 56962,
+    "n_fraud": 98,
+    "pr_auc": 0.874873175599537,
+    "roc_auc": 0.9841311313495573,
+    "precision": 0.9,
+    "recall": 0.826530612244898,
+    "f1": 0.8617021276595744,
+    "confusion_matrix": {
+      "tn": 56855,
+      "fp": 9,
+      "fn": 17,
+      "tp": 81
+    }
+  },
+  "onnx_parity": {
+    "n_rows": 56962,
+    "median_abs_prob_delta": 3.117401092822547e-08,
+    "p99_abs_prob_delta": 5.681152470060622e-06,
+    "max_abs_prob_delta": 0.17555108666419983,
+    "n_boundary_rows": 124,
+    "boundary_row_fraction": 0.002176889856395492,
+    "label_disagreements_at_threshold": 0,
+    "tolerances": {
+      "p99": 1e-05,
+      "boundary_fraction": 0.005,
+      "label_disagreements": 0
+    },
+    "note": "Non-zero max delta comes from rows sitting exactly on a split threshold, where float32 comparison differs between runtimes. Not a conversion error; see verify_parity()."
+  },
+  "provenance": {
+    "trained_at": "2026-09-04T02:28:44.428176+00:00",
+    "random_state": 42,
+    "train_duration_sec": 2016.6,
+    "versions": {
+      "numpy": "2.2.1",
+      "scikit_learn": "1.5.2",
+      "xgboost": "2.1.3",
+      "onnx": "1.17.0",
+      "onnxruntime": "1.20.1"
+    }
+  }
+}

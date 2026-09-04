@@ -1,0 +1,8 @@
+# RUNTIME dependencies only — this is what ships in the Docker image.
+# Deliberately excludes scikit-learn / xgboost / pandas: ONNX Runtime executes
+# the serialized graph standalone, so the training stack is not needed to serve.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.3
+numpy==2.2.1
+onnxruntime==1.20.1

@@ -1,0 +1,24 @@
+# Data — large, redistributable from Kaggle, never committed
+data/
+archive.zip
+*.csv
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Env / editor
+.env
+.DS_Store
+.idea/
+.vscode/
+
+# Terraform (Phase 3)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars

@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Tests (runtime deps only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # Runtime requirements ONLY -- no scikit-learn, xgboost or pandas.
+      # If a test ever needs the training stack to pass, that is a signal the
+      # test is not exercising the artifact the Docker image actually ships.
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest==8.3.4 httpx==0.28.1
+
+      - name: Confirm the training stack is absent
+        run: |
+          ! pip show scikit-learn xgboost pandas > /dev/null 2>&1 \
+            || (echo "Training libraries leaked into the runtime set" && exit 1)
+
+      # The dataset is gitignored and never reaches CI; tests run entirely
+      # against the committed ONNX model and its parity fixture.
+      - name: Verify committed model artifacts
+        run: |
+          test -f models/fraud_model.onnx
+          test -f models/metadata.json
+          test -f models/parity_fixture.json
+
+      - name: Run tests
+        run: pytest -v
