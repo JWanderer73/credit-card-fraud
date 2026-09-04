@@ -1,0 +1,270 @@
+name: Deploy
+
+# Runs only after CI has passed on main. The alternative -- deploying straight
+# from `on: push` and repeating the test job here -- would either duplicate CI
+# or race it.
+#
+# workflow_run carries a trap: the workflow file and the default `github.sha`
+# come from the DEFAULT BRANCH, not from the commit that triggered CI. Every
+# step below that needs the tested commit uses workflow_run.head_sha explicitly.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Deploy an image tag that is already in ECR instead of building. A tag that does not exist demonstrates auto-rollback on DEPLOYMENT_FAILURE."
+        required: false
+        type: string
+      simulate_failure:
+        description: "Break the replacement task set on purpose, to demonstrate auto-rollback. 'startup' = bad MODEL_PATH, task never goes healthy, rollback on DEPLOYMENT_FAILURE, production traffic never shifts. 'runtime' = healthy task that returns 500s, canary traffic shifts, the 5XX alarm fires, rollback on DEPLOYMENT_STOP_ON_ALARM. Drive load through the ALB during 'runtime' or the alarm has no datapoints to breach."
+        required: false
+        default: none
+        type: choice
+        options: [none, startup, runtime]
+
+# No stored AWS credentials anywhere in this repository. id-token: write is what
+# lets the job mint an OIDC token; AWS trades it for a short-lived session whose
+# trust policy is scoped to this repo and this branch.
+permissions:
+  id-token: write
+  contents: read
+
+# Blue/green deployments are stateful: a second one starting while the first is
+# still shifting traffic is rejected by CodeDeploy, and cancelling one midway
+# leaves a task set stranded. Queue instead.
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  # These follow "${project}-${environment}" from the Terraform module. If those
+  # variables are changed there, change them here; `terraform output` prints the
+  # authoritative values.
+  ECR_REPOSITORY: fraud-api-prod
+  ECS_CLUSTER: fraud-api-prod
+  ECS_SERVICE: fraud-api-prod
+  TASK_FAMILY: fraud-api-prod
+  CONTAINER_NAME: fraud-api
+  CODEDEPLOY_APP: fraud-api-prod
+  CODEDEPLOY_GROUP: fraud-api-prod-dg
+  ALB_NAME: fraud-api-prod
+
+jobs:
+  deploy:
+    name: Build, push, blue/green deploy
+    runs-on: ubuntu-latest
+
+    # A completed workflow_run fires on failure and cancellation too, so the
+    # conclusion has to be checked explicitly -- otherwise a red CI run deploys.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    steps:
+      - name: Resolve the commit under deployment
+        id: target
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            SHA="${{ github.event.workflow_run.head_sha }}"
+          else
+            SHA="${{ github.sha }}"
+          fi
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "Deploying commit ${SHA}"
+
+      - name: Require the deploy role to be configured
+        run: |
+          if [ -z "${{ vars.AWS_DEPLOY_ROLE_ARN }}" ]; then
+            echo "::error::Repository variable AWS_DEPLOY_ROLE_ARN is not set."
+            echo "Set it to the github_actions_role_arn output of the Terraform stack:"
+            echo "  gh variable set AWS_DEPLOY_ROLE_ARN --body \"\$(terraform -chdir=infra output -raw github_actions_role_arn)\""
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.target.outputs.sha }}
+
+      # No access keys. The role's trust policy pins the OIDC subject to
+      # repo:<owner>/<name>:ref:refs/heads/main, so a token minted by any other
+      # branch -- or by a fork's pull request -- cannot assume it.
+      - name: Assume the deploy role via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: gha-deploy-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+        if: ${{ !inputs.image_tag }}
+
+      # THE GATE. Not redundant with ci.yml's test job: that one runs pytest on
+      # the RUNNER, against runner-installed wheels. This runs the same suite
+      # INSIDE the linux/amd64 image being shipped, against the exact layers
+      # that reach Fargate.
+      #
+      # Local builds are arm64 and this image is never built on the laptop, so
+      # this is the only place the actual artifact is exercised before it is
+      # deployed. Skipping it reintroduces precisely the works-on-my-machine gap
+      # the multi-stage Dockerfile was designed to close.
+      - name: Test suite inside the linux/amd64 image
+        if: ${{ !inputs.image_tag }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: test
+          platforms: linux/amd64
+          push: false
+          load: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Tagged with the git SHA, never :latest. The ECR repository is
+      # IMMUTABLE, so the tag and the bytes are welded together: "which commit
+      # is serving traffic" is answerable from the running task definition
+      # alone, and a re-run cannot silently change what a tag points at.
+      - name: Build and push the runtime image
+        if: ${{ !inputs.image_tag }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.target.outputs.sha }}
+          cache-from: type=gha
+
+      - name: Resolve the image to deploy
+        id: image
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.image_tag }}"
+          if [ -z "$TAG" ]; then TAG="${{ steps.target.outputs.sha }}"; fi
+          echo "uri=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Image: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${TAG}"
+
+      # Terraform owns revision 1 and stops there; CodeDeploy owns the service's
+      # task definition from the first deployment onwards (which is why the
+      # service ignores task_definition changes). So the current live revision
+      # is the base to render from -- not a JSON file in the repository, which
+      # would drift from Terraform the moment either changed.
+      - name: Render the task definition
+        id: render
+        run: |
+          set -euo pipefail
+          aws ecs describe-task-definition \
+            --task-definition "$TASK_FAMILY" \
+            --query taskDefinition --output json > task-definition.json
+
+          # describe-task-definition returns read-only server-side fields that
+          # register-task-definition rejects. Stripping them is not optional.
+          FILTER='del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                      .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)
+                  | .containerDefinitions |= map(
+                      if .name == $name then .image = $image else . end)'
+
+          jq --arg image "${{ steps.image.outputs.uri }}" \
+             --arg name  "$CONTAINER_NAME" \
+             "$FILTER" task-definition.json > rendered.json
+
+          # Failure injection for the rollback demonstration. The two modes
+          # exercise DIFFERENT halves of the rollback wiring and are not
+          # interchangeable; both are driven by environment overrides on the
+          # rendered task definition, so neither needs a throwaway image.
+          #
+          #   startup  A model path that does not exist makes FraudModel.load
+          #            raise inside the FastAPI lifespan, so the process exits,
+          #            /ready never returns 200, the replacement task set never
+          #            goes healthy, and production traffic NEVER SHIFTS.
+          #            CodeDeploy rolls back on DEPLOYMENT_FAILURE. This proves
+          #            the load balancer refuses to promote a dead task set --
+          #            it never touches the alarms.
+          #
+          #   runtime  The chaos hook in app/config.py. The container starts
+          #            normally and /ready returns 200, so the task set is
+          #            promoted and the canary shifts 10% of production traffic
+          #            onto it -- and only then does inference return 500s.
+          #            HTTPCode_Target_5XX_Count breaches and CodeDeploy rolls
+          #            back on DEPLOYMENT_STOP_ON_ALARM. This is the one that
+          #            proves the alarm -> rollback chain actually works.
+          #
+          # Both alarms are treat_missing_data = notBreaching, so an idle load
+          # balancer produces no datapoints and nothing can breach. The runtime
+          # mode requires load running through the ALB for the duration of the
+          # deployment or a genuinely broken build is reported as a success.
+          case "${{ inputs.simulate_failure }}" in
+            startup)
+              echo "::warning::Injecting a broken MODEL_PATH. The task set will never go healthy; expect rollback on DEPLOYMENT_FAILURE."
+              INJECT_NAME=MODEL_PATH
+              INJECT_VALUE=/srv/models/does-not-exist.onnx
+              ;;
+            runtime)
+              echo "::warning::Enabling FAULT_INJECT_PREDICT. The task set WILL go healthy and WILL take canary traffic; expect 5XX and rollback on DEPLOYMENT_STOP_ON_ALARM. Drive load through the ALB now."
+              INJECT_NAME=FAULT_INJECT_PREDICT
+              INJECT_VALUE=true
+              ;;
+            *)
+              INJECT_NAME=""
+              ;;
+          esac
+
+          if [ -n "$INJECT_NAME" ]; then
+            jq --arg name  "$CONTAINER_NAME" \
+               --arg key   "$INJECT_NAME" \
+               --arg value "$INJECT_VALUE" '
+              .containerDefinitions |= map(
+                if .name == $name then
+                  .environment = ((.environment // [])
+                    | map(select(.name != $key))
+                    + [{name: $key, value: $value}])
+                else . end)' rendered.json > rendered.failure.json
+            mv rendered.failure.json rendered.json
+          fi
+
+          jq -r '.containerDefinitions[] | "\(.name) -> \(.image)"' rendered.json
+
+      # Registers the revision, uploads the AppSpec with <TASK_DEFINITION>
+      # substituted, creates the CodeDeploy deployment, and blocks until it
+      # settles.
+      #
+      # The wait covers the full lifecycle: the canary period
+      # (ECSCanary10Percent5Minutes holds 10% of traffic on the replacement task
+      # set for five minutes before shifting the rest) plus the bake window
+      # before the blue task set terminates (blue_termination_wait_minutes, 5 by
+      # default). A successful run is therefore ~11 minutes, nearly all of it
+      # deliberately spent with both task sets alive and rollback still one
+      # traffic shift away. The duration is the feature, not the overhead.
+      - name: Blue/green deployment via CodeDeploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: rendered.json
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true
+          codedeploy-appspec: .aws/appspec.yaml
+          codedeploy-application: ${{ env.CODEDEPLOY_APP }}
+          codedeploy-deployment-group: ${{ env.CODEDEPLOY_GROUP }}
+
+      - name: Smoke-test through the load balancer
+        run: |
+          set -euo pipefail
+          DNS=$(aws elbv2 describe-load-balancers \
+                  --names "$ALB_NAME" \
+                  --query 'LoadBalancers[0].DNSName' --output text)
+          echo "ALB: http://${DNS}"
+          curl -fsS --retry 5 --retry-delay 3 --retry-all-errors "http://${DNS}/ready"
+          echo
+          echo "### Deployed \`${{ steps.image.outputs.uri }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "http://${DNS}/docs" >> "$GITHUB_STEP_SUMMARY"

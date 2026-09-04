@@ -115,3 +115,64 @@ def test_openapi_documents_named_features(client):
     props = schema["components"]["schemas"]["Transaction"]["properties"]
     assert "Time" in props and "Amount" in props
     assert all(f"V{i}" in props for i in range(1, 29))
+
+
+# ---------------------------------------------------------------------------
+# Fault injection (FAULT_INJECT_PREDICT).
+#
+# This hook exists to drive the blue/green rollback demonstration, which means
+# it lives in the production inference path. Two things therefore have to be
+# true and stay true: it is OFF unless explicitly asked for, and when it is on
+# it fails inference WITHOUT failing the health checks -- a task that also went
+# unready would be caught by the load balancer and would never exercise the
+# alarm the demonstration is about.
+# ---------------------------------------------------------------------------
+
+
+def test_fault_injection_is_off_by_default(client, normal_payload):
+    from app.main import settings
+
+    assert settings.fault_inject_predict is False
+    assert client.post("/predict", json=normal_payload).status_code == 200
+
+
+def test_fault_injection_env_parsing(monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.delenv("FAULT_INJECT_PREDICT", raising=False)
+    assert get_settings().fault_inject_predict is False
+
+    # Every default in Settings is a default_factory precisely so that a value
+    # set after import is still observed; a plain default would have frozen the
+    # environment at class-body evaluation time and this would fail.
+    monkeypatch.setenv("FAULT_INJECT_PREDICT", "true")
+    assert get_settings().fault_inject_predict is True
+
+    monkeypatch.setenv("FAULT_INJECT_PREDICT", "false")
+    assert get_settings().fault_inject_predict is False
+
+
+def test_fault_injection_breaks_inference_but_not_health(
+    monkeypatch, client, normal_payload
+):
+    import dataclasses
+
+    import app.main as main
+
+    monkeypatch.setattr(
+        main, "settings", dataclasses.replace(main.settings, fault_inject_predict=True)
+    )
+
+    # Still healthy and still ready -- this is the point. The task stays in the
+    # target group, keeps taking traffic, and 500s on it.
+    assert client.get("/health").status_code == 200
+    assert client.get("/ready").status_code == 200
+
+    # One check in the shared _predict path, so both inference routes fail.
+    assert client.post("/predict", json=normal_payload).status_code == 500
+    assert (
+        client.post(
+            "/predict/batch", json={"transactions": [normal_payload]}
+        ).status_code
+        == 500
+    )

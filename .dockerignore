@@ -25,7 +25,11 @@ full-plan.md
 .idea/
 .vscode/
 
-# Terraform (Phase 3)
+# Terraform and deployment config -- not part of the application image, and
+# editing them should not invalidate a build cache layer.
+infra/
+.aws/
+scripts/
 .terraform/
 *.tfstate
 *.tfstate.*

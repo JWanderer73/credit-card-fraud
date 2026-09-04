@@ -33,6 +33,11 @@ async def lifespan(app: FastAPI):
     not come up and pass its health check.
     """
     model.load(settings)
+    if settings.fault_inject_predict:
+        logger.warning(
+            "FAULT_INJECT_PREDICT is enabled -- every inference request will "
+            "return 500. This is the auto-rollback demonstration, not a bug."
+        )
     yield
     model.unload()
 
@@ -50,6 +55,18 @@ app = FastAPI(
 
 
 def _predict(records: list[dict]) -> list[Prediction]:
+    # Chaos hook (FAULT_INJECT_PREDICT, off by default). Placed here rather
+    # than in the route handlers so it covers both /predict and /predict/batch,
+    # and deliberately below /health and /ready -- the whole point is a task
+    # that looks healthy to the load balancer, is given production traffic, and
+    # only then fails. That is what makes the 5XX alarm fire and CodeDeploy
+    # shift traffic back; a process that dies at startup never gets that far.
+    if settings.fault_inject_predict:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Fault injection enabled: inference deliberately failing.",
+        )
+
     features = model.build_input(records)
     probabilities = model.predict_proba(features)
     threshold = model.threshold

@@ -29,7 +29,6 @@ def _threshold_override() -> float | None:
     raw = os.getenv("FRAUD_THRESHOLD")
     return float(raw) if raw else None
 
-
 @dataclass(frozen=True)
 class Settings:
     model_path: Path = field(
@@ -54,6 +53,21 @@ class Settings:
     # thread pool oversubscribes the cores and reduces total throughput.
     intra_op_num_threads: int = field(
         default_factory=lambda: int(os.getenv("ORT_INTRA_OP_THREADS", "1"))
+    )
+    # Chaos hook, off unless explicitly enabled. Makes the inference path fail
+    # while leaving startup and /ready untouched -- the one failure shape no
+    # amount of bad configuration can otherwise produce here, because every
+    # other broken input (missing model, missing metadata, wrong feature count)
+    # raises inside FraudModel.load and kills the process before it serves.
+    #
+    # That shape is the one worth being able to reproduce on demand: a task set
+    # that passes its health check, takes production traffic, and only then
+    # returns errors is what exercises the CloudWatch alarm -> CodeDeploy
+    # auto-rollback chain. A task that never starts is caught by the load
+    # balancer and never proves the alarms work at all.
+    fault_inject_predict: bool = field(
+        default_factory=lambda: os.getenv("FAULT_INJECT_PREDICT", "").lower()
+        in {"1", "true", "yes"}
     )
 
 
