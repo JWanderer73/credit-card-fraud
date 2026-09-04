@@ -1,8 +1,8 @@
 # ---------------------------------------------------------------------------
 # Logs and alarms.
 #
-# The alarms here are not decorative. Two of them are wired into CodeDeploy's
-# rollback trigger (see codedeploy.tf), which is what turns "we have alarms"
+# The alarms here are not decorative. Two of them are named in the ECS
+# service's `alarms` block (see ecs.tf), which is what turns "we have alarms"
 # into "a bad deployment shifts traffic back on its own".
 # ---------------------------------------------------------------------------
 
@@ -27,7 +27,7 @@ resource "aws_cloudwatch_log_group" "app" {
 
 resource "aws_cloudwatch_metric_alarm" "target_5xx" {
   alarm_name          = "${local.name}-target-5xx"
-  alarm_description   = "Application returning 5XX. Wired to CodeDeploy auto-rollback."
+  alarm_description   = "Application returning 5XX. Wired to ECS deployment auto-rollback."
   namespace           = "AWS/ApplicationELB"
   metric_name         = "HTTPCode_Target_5XX_Count"
   statistic           = "Sum"
@@ -41,8 +41,8 @@ resource "aws_cloudwatch_metric_alarm" "target_5xx" {
   }
 
   # An idle load balancer emits no datapoints for this metric. Without this the
-  # alarm sits in INSUFFICIENT_DATA, and CodeDeploy refuses to start a
-  # deployment whose rollback alarms it cannot evaluate.
+  # alarm sits in INSUFFICIENT_DATA, which an alarm-gated deployment cannot
+  # evaluate -- so a bad build would ship unchallenged.
   treat_missing_data = "notBreaching"
 
   tags = { Name = "${local.name}-target-5xx" }
@@ -50,7 +50,7 @@ resource "aws_cloudwatch_metric_alarm" "target_5xx" {
 
 resource "aws_cloudwatch_metric_alarm" "p99_latency" {
   alarm_name          = "${local.name}-p99-latency"
-  alarm_description   = "p99 target response time above budget. Wired to CodeDeploy auto-rollback."
+  alarm_description   = "p99 target response time above budget. Wired to ECS deployment auto-rollback."
   namespace           = "AWS/ApplicationELB"
   metric_name         = "TargetResponseTime"
   extended_statistic  = "p99"

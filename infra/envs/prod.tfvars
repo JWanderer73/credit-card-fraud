@@ -28,12 +28,17 @@ cpu_target_utilization = 60
 log_retention_days = 7
 container_insights = false
 
-# Canary, not all-at-once. All-at-once puts 100% of traffic on a bad build and
-# only then waits a full alarm period to notice -- a real outage, which is the
-# opposite of what this stack exists to demonstrate. Canary exposes 10% for five
-# minutes on the same alarm signal. A deployment takes ~6 minutes instead of ~1.
-deployment_config_name        = "CodeDeployDefault.ECSCanary10Percent5Minutes"
-blue_termination_wait_minutes = 5
+# ECS-native blue/green. Canary, not all-at-once: all-at-once puts 100% of
+# traffic on a bad build and only then waits a full alarm period to notice --
+# a real outage, which is the opposite of what this stack exists to demonstrate.
+# 10% for five minutes reaches the same alarm on a tenth of the blast radius.
+# A deployment takes ~11 minutes end to end, most of it deliberate waiting.
+# CANARY, not BLUE_GREEN: in ECS's vocabulary BLUE_GREEN is the all-at-once
+# variant and CANARY is the one that shifts 10% first. Same machinery.
+deployment_strategy         = "CANARY"
+canary_percent              = 10
+canary_bake_time_in_minutes = 5
+bake_time_in_minutes        = 5
 
 # Closed. Set to ["<your.ip>/32"] to curl the green task set during the bake
 # window; CodeDeploy itself does not need this open.

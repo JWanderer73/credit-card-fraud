@@ -1,11 +1,11 @@
 # ---------------------------------------------------------------------------
 # Load balancer, two target groups, two listeners.
 #
-# The pair of target groups is what makes blue/green possible: CodeDeploy needs
+# The pair of target groups is what makes blue/green possible: ECS needs
 # somewhere to stand up the replacement task set and health-check it before any
 # production traffic moves. Both are created equal -- "blue" and "green" are
 # roles that swap on every deployment, not fixed identities. After the first
-# deployment the production listener points at green; after the second, back at
+# deployment the production rule points at green; after the second, back at
 # blue.
 # ---------------------------------------------------------------------------
 
@@ -105,12 +105,18 @@ resource "aws_lb_target_group" "green" {
   }
 }
 
-# --- Listeners --------------------------------------------------------------
+# --- Listeners and rules ---------------------------------------------------
 #
 # HTTPS is a known gap, not an oversight: ACM needs a domain to validate
 # against and this project has none. Adding it later is a certificate ARN, a
 # :443 listener with ssl_policy, and redirecting this listener to it -- the
 # structure below does not change.
+#
+# The forwarding lives in an explicit LISTENER RULE rather than the listener's
+# default action, because ECS-native blue/green is addressed to a rule ARN
+# (`advanced_configuration.production_listener_rule`) and a default action is
+# not separately addressable in Terraform. The listener default is therefore a
+# fixed 503 that nothing should ever reach: the rule matches every path.
 
 resource "aws_lb_listener" "production" {
   load_balancer_arn = aws_lb.main.arn
@@ -118,16 +124,13 @@ resource "aws_lb_listener" "production" {
   protocol          = "HTTP"
 
   default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.blue.arn
-  }
+    type = "fixed-response"
 
-  # CodeDeploy REWRITES this default action on every deployment -- that swap is
-  # the traffic shift. Without ignore_changes, the next `terraform plan` after
-  # any deployment proposes reverting production traffic to the old target
-  # group, which is both a permanent diff and an outage waiting to be applied.
-  lifecycle {
-    ignore_changes = [default_action]
+    fixed_response {
+      content_type = "text/plain"
+      message_body = "No route matched. The forwarding rule is missing."
+      status_code  = "503"
+    }
   }
 
   tags = { Name = "${local.name}-production" }
@@ -139,12 +142,67 @@ resource "aws_lb_listener" "test" {
   protocol          = "HTTP"
 
   default_action {
+    type = "fixed-response"
+
+    fixed_response {
+      content_type = "text/plain"
+      message_body = "No route matched. The forwarding rule is missing."
+      status_code  = "503"
+    }
+  }
+
+  tags = { Name = "${local.name}-test" }
+}
+
+# ECS REWRITES these rules' actions on every deployment -- that rewrite is the
+# traffic shift, and during the canary phase the production rule carries a
+# weighted forward across both target groups. Without ignore_changes, the next
+# plan after any deployment proposes reverting production traffic to whichever
+# target group Terraform last recorded, which is both a permanent diff and an
+# outage waiting to be applied.
+#
+# Which group is "blue" and which is "green" alternates with each deployment;
+# the assignment below is only the starting position.
+
+resource "aws_lb_listener_rule" "production" {
+  listener_arn = aws_lb_listener.production.arn
+  priority     = 1
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.blue.arn
+  }
+
+  condition {
+    path_pattern {
+      values = ["/*"]
+    }
+  }
+
+  lifecycle {
+    ignore_changes = [action]
+  }
+
+  tags = { Name = "${local.name}-production" }
+}
+
+resource "aws_lb_listener_rule" "test" {
+  listener_arn = aws_lb_listener.test.arn
+  priority     = 1
+
+  action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.green.arn
   }
 
+  condition {
+    path_pattern {
+      values = ["/*"]
+    }
+  }
+
   lifecycle {
-    ignore_changes = [default_action]
+    ignore_changes = [action]
   }
 
   tags = { Name = "${local.name}-test" }

@@ -289,7 +289,7 @@ Fargate there is no such boundary.
 ## AWS deployment
 
 Terraform in [`infra/`](infra/) stands up ECS Fargate behind an Application Load
-Balancer across two availability zones, deployed blue/green by CodeDeploy from
+Balancer across two availability zones, deployed as an ECS-native canary from
 GitHub Actions over OIDC. 61 resources, one flat root module, no NAT gateway.
 
 The claim this section supports is **multi-AZ, zero-downtime deploys with
@@ -302,7 +302,7 @@ second half of that literally true rather than aspirational.
                      :80    │
                    ┌────────▼─────────┐
                    │  ALB (public)    │  alb_sg: :80 from 0.0.0.0/0
-                   │  2 public subnets│  :8080 test listener (CodeDeploy)
+                   │  2 public subnets│  :8080 test listener (blue/green)
                    └───┬──────────┬───┘
           blue TG      │          │      green TG
                        │          │
@@ -380,9 +380,9 @@ becomes a structural property of the graph rather than an arithmetic claim about
 address ranges, and it stays true if the subnets are ever renumbered.
 
 No SSH anywhere. No `0.0.0.0/0` ingress on tasks. `assign_public_ip = false`.
-The CodeDeploy test listener on `:8080` is closed by default — CodeDeploy only
-re-points it, it never connects to it, so leaving it open would add a second
-internet-facing entry point for nothing. Set `test_listener_allowed_cidrs` to
+The blue/green test listener on `:8080` is closed by default — ECS only
+re-points its rule, it never connects to it, so leaving it open would add a
+second internet-facing entry point for nothing. Set `test_listener_allowed_cidrs` to
 your own address to hand-validate a green task set during the bake window.
 
 `scripts/verify-deployment.sh` asserts all of this against the live account
@@ -397,6 +397,40 @@ and keeps the old task set alive for a five-minute bake afterwards. If an alarm
 trips at any point, traffic shifts **back** — to tasks that are already running
 and already warm, so the rollback is a load-balancer operation rather than a
 fresh deployment.
+
+This is **ECS-native**, not CodeDeploy. The original design used CodeDeploy —
+the conventional answer for ECS blue/green — but this AWS account cannot
+subscribe to that service:
+
+```
+SubscriptionRequiredException: The AWS Access Key Id needs a subscription
+```
+
+Every other service tested fine, so it was CodeDeploy specifically. ECS's own
+deployment controller covers the same ground and turned out to be the better
+answer regardless: it removes an entire service, its service role, an
+`appspec.yaml`, and the ownership fight where CodeDeploy rewrites the service's
+task definition and load-balancer config behind Terraform's back. The blue/green
+behaviour is *declared on the service* in Terraform instead, which means the
+deploy workflow is a plain `UpdateService`.
+
+**A naming trap that would have shipped a silent outage.** ECS's strategies are
+`CANARY`, `BLUE_GREEN` and `ROLLING`, and in that vocabulary **`BLUE_GREEN` is
+the all-at-once variant** — stand up the replacement, shift 100%, bake, tear
+down the original. `CANARY` is a separate strategy that shifts a percentage
+first. The Terraform schema nests `canary_configuration` *inside*
+`deployment_configuration`, which reads as though it modifies blue/green; it
+does not, and the API says so:
+
+```
+InvalidParameterException: Canary configuration can only be present
+with CANARY deployment strategy
+```
+
+Set `BLUE_GREEN` with a canary block and Terraform applies clean, state shows
+what you asked for, and AWS silently drops the canary — so the first bad build
+takes 100% of traffic. The stack uses `CANARY`, and the only way to catch this
+was to read the live service back from the API rather than trusting the plan.
 
 **Canary rather than all-at-once, and that choice is the "zero downtime"
 claim.** All-at-once moves 100% of traffic onto the replacement task set and
@@ -414,8 +448,9 @@ strictly more faithful rehearsal than a second, smaller stack; and a second
 environment would double the ALB, the dominant cost line. An `environment`
 variable keeps a second stack one `-var-file` away.
 
-Two alarms are wired into the rollback trigger — `HTTPCode_Target_5XX_Count` and
-p99 `TargetResponseTime` — both scoped to the **load balancer** dimension, not to
+Two alarms are named in the service's `alarms` block with `rollback = true` —
+`HTTPCode_Target_5XX_Count` and p99 `TargetResponseTime` — both scoped to the
+**load balancer** dimension, not to
 a target group. Under blue/green the production target group alternates on every
 deployment, so a target-group-scoped alarm would spend half its life watching
 the idle group.
@@ -433,22 +468,29 @@ routed.
 **No traffic, no alarm — and this is a trap, not a footnote.** Both rollback
 alarms are `treat_missing_data = "notBreaching"`, and they have to be: an idle
 load balancer emits no datapoints, which would park them in
-`INSUFFICIENT_DATA`, and CodeDeploy refuses to start a deployment whose alarms
-it cannot evaluate. The consequence is that **an idle ALB can never breach
-either alarm** — a genuinely broken build deploys clean and CodeDeploy reports
-success. Any rollback demonstration therefore requires load running through the
+`INSUFFICIENT_DATA`, which an alarm-gated deployment cannot evaluate. The
+consequence is that **an idle ALB can never breach either alarm** — a genuinely
+broken build deploys clean and ECS reports success. Any rollback demonstration therefore requires load running through the
 load balancer *for the duration of the deployment*, not before it.
 
 Two more traps, both of which show up as *permanent diffs* rather than errors:
 
-- Once `deployment_controller = CODE_DEPLOY`, CodeDeploy owns the service's task
-  definition and load-balancer configuration. Terraform still holds revision 1
-  and the blue target group in state, so without
-  `lifecycle { ignore_changes = [task_definition, load_balancer, desired_count] }`
-  every plan after every deployment proposes reverting the running service to
-  the bootstrap image. This is the single most common way this setup breaks.
-- CodeDeploy rewrites the listeners' `default_action` on every traffic shift —
-  that swap *is* the deployment — so both listeners ignore changes to it too.
+- ECS rewrites the **listener rules** on every traffic shift — that rewrite *is*
+  the deployment, and during the canary the production rule carries a weighted
+  forward across both target groups. So `aws_lb_listener_rule` carries
+  `ignore_changes = [action]`; without it, the next plan after any deployment
+  proposes reverting production traffic to whichever group Terraform last
+  recorded.
+- The forwarding lives in an explicit listener **rule** rather than a listener
+  default action, because `advanced_configuration.production_listener_rule`
+  takes a rule ARN and a default action is not separately addressable in
+  Terraform. The listener defaults are a fixed 503 nothing should ever reach.
+- `task_definition` and `desired_count` are ignored on the service — the deploy
+  workflow owns one, Application Auto Scaling the other. `load_balancer` is
+  deliberately **not** ignored, and that is a trap in itself:
+  `advanced_configuration` lives inside that block, so ignoring it means the
+  blue/green wiring is never sent and `UpdateService` fails with
+  *"advancedConfiguration field is required for all loadBalancers"*.
 
 ### Autoscaling on CPU, not request count
 
@@ -472,8 +514,8 @@ scale-out is on the evidence list rather than assumed.
 
 **The alarm thresholds are the same problem with higher stakes**, because they
 gate every deployment. Set `alarm_p99_latency_seconds` or `alarm_5xx_threshold`
-too tight and every deploy rolls itself back, which reads as CodeDeploy being
-broken; too loose and the rollback demonstration never fires. The correct
+too tight and every deploy rolls itself back, which reads as the deployment
+mechanism being broken; too loose and the rollback demonstration never fires. The correct
 sequence is **apply → benchmark through the ALB → set the thresholds from the
 measurement → then attempt the rollback demo**.
 
@@ -511,7 +553,7 @@ repository is a mailing list waiting to happen.
 4. docker build --target runtime --platform linux/amd64
 5. push, tagged with the git SHA, never :latest
 6. render the live task definition with the new image
-7. CodeDeploy blue/green deployment via .aws/appspec.yaml
+7. UpdateService — the canary shape is declared on the service, not here
 8. wait for the deployment to settle, then smoke-test through the ALB
 ```
 
@@ -593,17 +635,17 @@ otherwise carry — one fewer resource, and one fewer thing to forget to destroy
 The evidence worth capturing is not that the mechanism exists but that it works.
 **There are two rollback paths and they are not interchangeable:**
 
-| broken how | what CodeDeploy sees | what rolls it back |
+| broken how | what ECS sees | what rolls it back |
 |---|---|---|
-| container will not start | green tasks never pass the ALB health check on `/ready`, so **traffic never shifts** | `DEPLOYMENT_FAILURE` — the deployment times out |
-| container starts, `/ready` returns 200, inference returns 500 | green tasks look healthy, **the canary shifts 10% of traffic**, then real requests fail | `DEPLOYMENT_STOP_ON_ALARM` — the 5XX alarm breaches |
+| container will not start | the replacement task set never passes the ALB health check on `/ready`, so **traffic never shifts** | the deployment fails and is rolled back |
+| container starts, `/ready` returns 200, inference returns 500 | the task set looks healthy, **the canary shifts 10% of traffic**, then real requests fail | the 5XX alarm breaches and the `alarms` rollback fires |
 
 The first is the boring one: nothing bad ever reaches a user, but the alarms and
 the `alarm_configuration` block are never touched. It shows that the load
 balancer refuses to promote a dead task set — not that the rollback wiring
 works. **The headline demo is the second**, because it exercises the whole
-chain: alarm → CodeDeploy → traffic shifted back to blue tasks that are still
-running and still warm.
+chain: alarm → ECS → traffic shifted back to tasks that are still running and
+still warm.
 
 Both are driven from `workflow_dispatch`, and **neither needs a throwaway
 image** — each is one environment override on the rendered task definition:
@@ -619,8 +661,8 @@ gh workflow run deploy.yml -f simulate_failure=runtime
 
 | mode | override | path exercised |
 |---|---|---|
-| `startup` | `MODEL_PATH=/srv/models/does-not-exist.onnx` | `FraudModel.load` raises in the lifespan handler, the process exits, `/ready` never answers → `DEPLOYMENT_FAILURE` |
-| `runtime` | `FAULT_INJECT_PREDICT=true` | container starts, `/ready` returns 200, the task set is promoted, the canary shifts 10% of traffic onto it, *then* inference 500s → `DEPLOYMENT_STOP_ON_ALARM` |
+| `startup` | `MODEL_PATH=/srv/models/does-not-exist.onnx` | `FraudModel.load` raises in the lifespan handler, the process exits, `/ready` never answers → deployment failure, traffic never shifts |
+| `runtime` | `FAULT_INJECT_PREDICT=true` | container starts, `/ready` returns 200, the task set is promoted, the canary shifts 10% of traffic onto it, *then* inference 500s → the 5XX alarm breaches and ECS shifts back |
 
 **Why a chaos hook rather than just more bad configuration.** No environment
 variable can produce the `runtime` shape on its own: model path, metadata path
@@ -657,25 +699,169 @@ Asserts, and exits non-zero on any violated claim:
    connection to a task's private address from outside the VPC does not succeed
 5. no alarm is in `ALARM`, and application logs are reaching CloudWatch
 
-The rest of the evidence is captured by hand, in this order — the benchmark has
-to come before the thresholds, and the thresholds before the rollback demo:
+### The evidence runbook
 
-1. `terraform plan` / `apply` output
-2. `curl <alb-dns>/ready` and `/docs` through the load balancer
-3. **benchmark through the ALB** — the first number measured against real
-   infrastructure rather than localhost, reported alongside the local 4,120/s
-4. `./scripts/verify-deployment.sh` for the security claims
-5. **the rollback, recorded rather than screenshotted** — `simulate_failure:
-   runtime` with load running, showing the canary shift, the 5XX alarm
-   breaching, and traffic going back to the still-warm blue task set. A
-   forty-second clip is worth more than any paragraph about it, and it is the
-   artifact that survives teardown. Run `simulate_failure: startup` too; it is
-   one more dispatch and it shows the other path
-6. **autoscaling actually scaling** — hold load until the CPU target is
-   breached, capture the scale-out from 2 tasks, then the scale-in
-7. multi-AZ: tasks in two AZs; stop one and show the ALB routing on
-8. CloudWatch logs, and the alarms back in `OK`
-9. `terraform destroy`, and the budget confirming spend returned to zero
+Two prerequisites, both easy to trip over:
+
+```bash
+export AWS_REGION=us-east-1   # Terraform gets this from tfvars; ad-hoc `aws` calls do not
+gh auth login                 # needed for `gh variable set` and `gh workflow run`
+```
+
+There are **no AWS credentials to put anywhere in GitHub** — that is what the
+OIDC provider is for. The one value the repository holds is
+`AWS_DEPLOY_ROLE_ARN`, and it is a repository *variable* rather than a secret,
+because a role ARN is useless without an OIDC token whose `sub` matches the
+trust policy.
+
+The rest of the evidence is captured by hand, and the **order is not
+arbitrary**. Two constraints drive it:
+
+- The alarm thresholds gate every deployment, so they have to be set from a
+  measurement rather than guessed — which means the benchmark comes before the
+  rollback demo.
+- Autoscaling has to be *held still* for two of these steps and *live* for a
+  third, because Application Auto Scaling and the deployment controller both
+  act on the same ECS service.
+
+| step | autoscaling | load |
+|---|---|---|
+| capacity benchmark | **suspended** — a scale-out mid-run silently changes the denominator being measured | high, short bursts |
+| rollback demo | **suspended** — exactly one variable moving, so the rollback is unambiguously the alarm | low, sustained |
+| scale-out demo | **live** — it is the thing being demonstrated | high, sustained |
+
+`suspend_autoscaling` stops scaling *activities* without releasing
+`min_capacity`, so the service holds at two tasks rather than draining.
+Flipping it is a single-resource apply.
+
+#### A · Stand it up
+
+The four steps under [Deploying it](#deploying-it). Capture the `plan` and
+`apply` output — it is evidence item one, and it is what makes "one `apply`
+away from standing this up again" checkable rather than asserted.
+
+#### B · Security evidence — no load required
+
+```bash
+./scripts/verify-deployment.sh
+```
+
+Then multi-AZ failover by hand: stop one task and watch the ALB keep serving
+from the other AZ while ECS replaces it.
+
+```bash
+CLUSTER=$(terraform -chdir=infra output -raw ecs_cluster_name)
+SERVICE=$(terraform -chdir=infra output -raw ecs_service_name)
+aws ecs stop-task --cluster "$CLUSTER" \
+  --task "$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" \
+            --query 'taskArns[0]' --output text)" \
+  --reason "multi-AZ failover evidence"
+```
+
+#### C · Measure per-task capacity
+
+```bash
+terraform -chdir=infra apply -var-file=envs/prod.tfvars -var suspend_autoscaling=true
+
+ALB=$(terraform -chdir=infra output -raw alb_dns_name)
+python scripts/benchmark.py --url "http://$ALB" --mode single \
+  --processes 4 --concurrency 4 --duration 90
+```
+
+Raise concurrency until the two tasks saturate. This is the first number
+measured against real infrastructure rather than localhost — report it next to
+the local 4,120/s, and expect it to be lower for two reasons that are worth
+separating: 0.5 vCPU instead of an M1, and public-internet RTT instead of
+loopback.
+
+Runs are kept to ~90 s deliberately. ECS target tracking needs three
+consecutive minutes above target to scale out, so nothing could move even
+unsuspended — the suspension is belt-and-braces here, and load-bearing in E.
+
+#### D · Set the thresholds from what you measured
+
+`cpu_target_utilization`, `alarm_p99_latency_seconds` and
+`alarm_5xx_threshold` in `envs/prod.tfvars`, then apply — still suspended.
+
+This is the step that is easy to skip and expensive to skip. Until it is done
+those values are guesses: too tight and every deployment in step E rolls itself
+back, which reads as the deployment mechanism being broken; too loose and the
+demo never fires.
+
+#### E · The rollback — recorded, not screenshotted
+
+Still suspended, service pinned at two tasks. **Start the load first and leave
+it running**, in two terminals:
+
+```bash
+# terminal 1 — load. Low on purpose: 10% of this reaching the broken task set
+# is already tens of times the 5XX threshold, and it is nowhere near enough CPU
+# to trigger a scale-out even if autoscaling were live.
+python scripts/benchmark.py --url "http://$ALB" --mode single \
+  --processes 2 --concurrency 2 --duration 1200
+
+# terminal 2 — the visible artifact. The benchmark prints nothing until it
+# exits; this is what goes in the recording.
+python -c "
+import json, pathlib
+f = json.loads(pathlib.Path('models/parity_fixture.json').read_text())
+print(json.dumps(dict(zip(f['feature_names'], f['rows'][0]))))
+" > payload.json
+
+while true; do
+  curl -s -o /dev/null -w '%{http_code} ' "http://$ALB/predict" \
+    -H 'content-type: application/json' -d @payload.json
+  sleep 0.2
+done
+```
+
+```bash
+gh workflow run deploy.yml -f simulate_failure=runtime
+```
+
+The shot worth capturing is terminal 2: a wall of `200`s, then a minute or two
+of `200 200 500 200` as the canary puts 10% of traffic on the broken task set,
+then a wall of `200`s again once ECS shifts back. **That is what "zero
+downtime" looks like** — the other 90% never noticed, and the rollback lands on
+blue tasks that are still running and still warm.
+
+Then the other path, which needs no load at all because traffic never shifts:
+
+```bash
+gh workflow run deploy.yml -f simulate_failure=startup
+```
+
+#### F · Autoscaling, actually scaling
+
+```bash
+terraform -chdir=infra apply -var-file=envs/prod.tfvars   # resume
+
+python scripts/benchmark.py --url "http://$ALB" --mode single \
+  --processes 4 --concurrency 8 --duration 900
+```
+
+Capture the scale-out from two tasks in the service events:
+
+```bash
+aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+  --query 'services[0].events[:10].message' --output table
+```
+
+**Rollback before scale-out, deliberately.** ECS target tracking scales *in*
+only after fifteen consecutive minutes below target, so running this first
+would leave the service at four-to-six tasks and a quarter-hour wait before the
+rollback demo had a clean two-task baseline. This way nothing blocks on it —
+capture the scale-in tail if it is convenient, or note it and tear down.
+
+#### G · Tear down
+
+CloudWatch logs and the alarms back in `OK`, then:
+
+```bash
+terraform -chdir=infra destroy -var-file=envs/prod.tfvars
+```
+
+and the budget confirming spend returned to zero.
 
 ### Cost and teardown
 
@@ -821,10 +1007,9 @@ asserted as three things instead:
 - [x] **Phase 2 — Docker.** Multi-stage build, 382 MB, in-image test stage.
 - [x] **Phase 3 — AWS.** Terraform (61 resources), ECS Fargate across 2 AZs
       behind an ALB, no NAT and no internet egress, CPU target-tracking
-      autoscaling, CodeDeploy blue/green canary with alarm-driven auto-rollback,
-      and a GitHub Actions OIDC deploy with no stored credentials. Written and
-      plan-verified; the stack is applied for evidence capture and then
-      destroyed.
+      autoscaling, ECS-native canary deployments with alarm-driven
+      auto-rollback, and a GitHub Actions OIDC deploy with no stored
+      credentials. Applied for evidence capture, then destroyed.
 
 **On wording.** The claim worth making is **"multi-AZ, zero-downtime deploys
 with automated rollback"** — not "highly available." It is more specific, it is
@@ -854,17 +1039,15 @@ true at Phase 3 (2 AZs, ≥2 tasks); Phases 1–2 do not support it on their own
 │   ├── endpoints.tf        # ecr.api / ecr.dkr / logs interface, s3 gateway
 │   ├── security.tf         # the three security groups, all SG-to-SG
 │   ├── ecr.tf              # immutable tags, scan on push, lifecycle policy
-│   ├── alb.tf              # ALB, blue/green target groups, prod + test listeners
-│   ├── ecs.tf              # cluster, task definition, CODE_DEPLOY service
+│   ├── alb.tf              # ALB, blue/green target groups, listeners + rules
+│   ├── ecs.tf              # cluster, task definition, canary service
 │   ├── autoscaling.tf      # CPU target tracking, 2–6 tasks
-│   ├── codedeploy.tf       # blue/green, bake window, auto-rollback
-│   ├── iam.tf              # GitHub OIDC, deploy/execution/task/CodeDeploy roles
+│   ├── iam.tf              # GitHub OIDC, deploy/execution/task/infra roles
 │   ├── observability.tf    # log group, alarms, ALB access logs, budget
 │   ├── outputs.tf
 │   └── envs/prod.tfvars
-├── .aws/appspec.yaml       # CodeDeploy ECS AppSpec
 ├── scripts/bootstrap-state.sh    # one-time: state bucket + backend.hcl
 ├── scripts/verify-deployment.sh  # asserts the security claims against AWS
 ├── .github/workflows/ci.yml
-└── .github/workflows/deploy.yml  # OIDC → build → push → blue/green
+└── .github/workflows/deploy.yml  # OIDC → build → push → canary deploy
 ```

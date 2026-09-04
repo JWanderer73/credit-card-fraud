@@ -16,11 +16,11 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Deploy an image tag that is already in ECR instead of building. A tag that does not exist demonstrates auto-rollback on DEPLOYMENT_FAILURE."
+        description: "Deploy an image tag that is already in ECR instead of building. A tag that does not exist demonstrates auto-a failed deployment rolled back."
         required: false
         type: string
       simulate_failure:
-        description: "Break the replacement task set on purpose, to demonstrate auto-rollback. 'startup' = bad MODEL_PATH, task never goes healthy, rollback on DEPLOYMENT_FAILURE, production traffic never shifts. 'runtime' = healthy task that returns 500s, canary traffic shifts, the 5XX alarm fires, rollback on DEPLOYMENT_STOP_ON_ALARM. Drive load through the ALB during 'runtime' or the alarm has no datapoints to breach."
+        description: "Break the replacement task set on purpose, to demonstrate auto-rollback. 'startup' = bad MODEL_PATH, task never goes healthy, a failed deployment rolled back, production traffic never shifts. 'runtime' = healthy task that returns 500s, canary traffic shifts, the 5XX alarm fires, rollback on the 5XX alarm. Drive load through the ALB during 'runtime' or the alarm has no datapoints to breach."
         required: false
         default: none
         type: choice
@@ -34,7 +34,7 @@ permissions:
   contents: read
 
 # Blue/green deployments are stateful: a second one starting while the first is
-# still shifting traffic is rejected by CodeDeploy, and cancelling one midway
+# still shifting traffic is rejected by ECS, and cancelling one midway
 # leaves a task set stranded. Queue instead.
 concurrency:
   group: deploy-prod
@@ -50,8 +50,6 @@ env:
   ECS_SERVICE: fraud-api-prod
   TASK_FAMILY: fraud-api-prod
   CONTAINER_NAME: fraud-api
-  CODEDEPLOY_APP: fraud-api-prod
-  CODEDEPLOY_GROUP: fraud-api-prod-dg
   ALB_NAME: fraud-api-prod
 
 jobs:
@@ -154,11 +152,11 @@ jobs:
           echo "uri=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${TAG}" >> "$GITHUB_OUTPUT"
           echo "Image: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${TAG}"
 
-      # Terraform owns revision 1 and stops there; CodeDeploy owns the service's
-      # task definition from the first deployment onwards (which is why the
-      # service ignores task_definition changes). So the current live revision
-      # is the base to render from -- not a JSON file in the repository, which
-      # would drift from Terraform the moment either changed.
+      # Terraform owns revision 1 and stops there; every revision after that is
+      # registered here (which is why the service ignores task_definition
+      # changes). So the current live revision is the base to render from --
+      # not a JSON file in the repository, which would drift from Terraform the
+      # moment either changed.
       - name: Render the task definition
         id: render
         run: |
@@ -187,7 +185,7 @@ jobs:
           #            raise inside the FastAPI lifespan, so the process exits,
           #            /ready never returns 200, the replacement task set never
           #            goes healthy, and production traffic NEVER SHIFTS.
-          #            CodeDeploy rolls back on DEPLOYMENT_FAILURE. This proves
+          #            ECS rolls back on DEPLOYMENT_FAILURE. This proves
           #            the load balancer refuses to promote a dead task set --
           #            it never touches the alarms.
           #
@@ -195,8 +193,8 @@ jobs:
           #            normally and /ready returns 200, so the task set is
           #            promoted and the canary shifts 10% of production traffic
           #            onto it -- and only then does inference return 500s.
-          #            HTTPCode_Target_5XX_Count breaches and CodeDeploy rolls
-          #            back on DEPLOYMENT_STOP_ON_ALARM. This is the one that
+          #            HTTPCode_Target_5XX_Count breaches and ECS rolls
+          #            back on the 5XX alarm. This is the one that
           #            proves the alarm -> rollback chain actually works.
           #
           # Both alarms are treat_missing_data = notBreaching, so an idle load
@@ -205,12 +203,12 @@ jobs:
           # deployment or a genuinely broken build is reported as a success.
           case "${{ inputs.simulate_failure }}" in
             startup)
-              echo "::warning::Injecting a broken MODEL_PATH. The task set will never go healthy; expect rollback on DEPLOYMENT_FAILURE."
+              echo "::warning::Injecting a broken MODEL_PATH. The task set will never go healthy; expect a failed deployment rolled back."
               INJECT_NAME=MODEL_PATH
               INJECT_VALUE=/srv/models/does-not-exist.onnx
               ;;
             runtime)
-              echo "::warning::Enabling FAULT_INJECT_PREDICT. The task set WILL go healthy and WILL take canary traffic; expect 5XX and rollback on DEPLOYMENT_STOP_ON_ALARM. Drive load through the ALB now."
+              echo "::warning::Enabling FAULT_INJECT_PREDICT. The task set WILL go healthy and WILL take canary traffic; expect 5XX and rollback on the 5XX alarm. Drive load through the ALB now."
               INJECT_NAME=FAULT_INJECT_PREDICT
               INJECT_VALUE=true
               ;;
@@ -234,27 +232,27 @@ jobs:
 
           jq -r '.containerDefinitions[] | "\(.name) -> \(.image)"' rendered.json
 
-      # Registers the revision, uploads the AppSpec with <TASK_DEFINITION>
-      # substituted, creates the CodeDeploy deployment, and blocks until it
-      # settles.
+      # Registers the revision and hands it to the service, then blocks until
+      # the deployment settles.
       #
-      # The wait covers the full lifecycle: the canary period
-      # (ECSCanary10Percent5Minutes holds 10% of traffic on the replacement task
-      # set for five minutes before shifting the rest) plus the bake window
-      # before the blue task set terminates (blue_termination_wait_minutes, 5 by
-      # default). A successful run is therefore ~11 minutes, nearly all of it
-      # deliberately spent with both task sets alive and rollback still one
-      # traffic shift away. The duration is the feature, not the overhead.
-      - name: Blue/green deployment via CodeDeploy
+      # Blue/green is configured on the SERVICE, not here -- strategy, canary
+      # shape, bake time and the rollback alarms all live in Terraform. So this
+      # is a plain UpdateService: no appspec, no second service to orchestrate,
+      # no <TASK_DEFINITION> placeholder to substitute.
+      #
+      # The wait covers the full lifecycle: the canary period (10% of traffic
+      # held on the replacement task set for five minutes before the rest
+      # shifts) plus the bake window before the original task set is torn down.
+      # A successful run is therefore ~11 minutes, nearly all of it deliberately
+      # spent with both task sets alive and rollback still one traffic shift
+      # away. The duration is the feature, not the overhead.
+      - name: Blue/green deployment
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
           task-definition: rendered.json
           cluster: ${{ env.ECS_CLUSTER }}
           service: ${{ env.ECS_SERVICE }}
           wait-for-service-stability: true
-          codedeploy-appspec: .aws/appspec.yaml
-          codedeploy-application: ${{ env.CODEDEPLOY_APP }}
-          codedeploy-deployment-group: ${{ env.CODEDEPLOY_GROUP }}
 
       - name: Smoke-test through the load balancer
         run: |

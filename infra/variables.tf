@@ -65,7 +65,7 @@ variable "container_port" {
 }
 
 variable "container_name" {
-  description = "Container name. CodeDeploy's appspec references this by name, so it must match .aws/appspec.yaml."
+  description = "Container name. The service's load_balancer block binds the target groups to this container, so it must match the task definition."
   type        = string
   default     = "fraud-api"
 }
@@ -73,9 +73,9 @@ variable "container_name" {
 variable "image_tag" {
   description = <<-EOT
     Image tag for the task definition Terraform registers. Terraform only ever
-    creates the FIRST revision; CodeDeploy owns the service's task definition
-    thereafter and the deploy workflow registers git-SHA-tagged revisions. The
-    default bootstraps the stack before any image exists.
+    creates the FIRST revision; the deploy workflow registers every git-SHA-
+    tagged revision thereafter and hands it to the service. The default
+    bootstraps the stack before any image exists.
   EOT
   type        = string
   default     = "bootstrap"
@@ -171,6 +171,26 @@ variable "cpu_target_utilization" {
   default     = 60
 }
 
+variable "suspend_autoscaling" {
+  description = <<-EOT
+    Suspend Application Auto Scaling activities without destroying the target.
+
+    Two pieces of evidence in this phase need the task count to hold still.
+    The capacity benchmark is measuring per-task throughput, so a scale-out
+    mid-run silently changes the denominator; and the rollback demonstration
+    needs exactly one variable moving, because Application Auto Scaling and
+    ECS's deployment controller both act on the same service, and a scaling
+    activity landing in the middle of a blue/green deployment makes it
+    ambiguous whether the alarm or the interference caused the rollback.
+
+    Suspending stops scaling ACTIVITIES; it does not release min_capacity, so
+    the service stays where it is rather than draining. Flipping this is a
+    single-resource apply, a few seconds either way.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "scale_in_cooldown" {
   description = "Seconds to wait before a further scale-in. Longer than scale-out: shedding capacity too eagerly is the expensive mistake."
   type        = number
@@ -213,7 +233,7 @@ variable "deregistration_delay" {
 }
 
 variable "test_listener_port" {
-  description = "Port for the CodeDeploy test listener, which fronts the green target group during a deployment."
+  description = "Port for the test listener, which fronts the replacement target group during a deployment."
   type        = number
   default     = 8080
 }
@@ -232,43 +252,71 @@ variable "test_listener_allowed_cidrs" {
 
 # --- Deployment -------------------------------------------------------------
 
-variable "deployment_config_name" {
+variable "deployment_strategy" {
   description = <<-EOT
-    CodeDeploy traffic-shift strategy.
+    ECS deployment strategy.
 
-    Canary rather than AllAtOnce, and the difference is the whole "zero
-    downtime" claim. AllAtOnce moves 100% of traffic to the replacement task
-    set and only THEN does the 5xx alarm need a full 60-second period to
-    breach before rollback begins -- a real one-to-three minute outage, which
-    contradicts the property this stack exists to demonstrate. Under canary
-    only 10% of requests reach a bad build, the alarm fires on exactly the same
-    signal, and the claim is true rather than aspirational.
+    A naming trap worth knowing: in ECS's vocabulary "BLUE_GREEN" means the
+    ALL-AT-ONCE variant -- stand up the replacement task set, shift 100% of
+    traffic once it is healthy, bake, then tear down the original. "CANARY" is
+    a separate strategy that shifts a percentage first, bakes, then shifts the
+    rest. Both run the same two-target-group machinery underneath; the API
+    rejects a canary_configuration on BLUE_GREEN outright:
 
-    The cost is a ~6-minute deployment instead of a ~1-minute one.
-    CodeDeployDefault.ECSLinear10PercentEvery1Minutes is the other realistic
-    option and takes ten.
+      InvalidParameterException: Canary configuration can only be present
+      with CANARY deployment strategy
+
+    CANARY is the default here because all-at-once puts 100% of traffic on a
+    bad build and only THEN waits a full alarm period to notice -- a real
+    one-to-three minute outage, which contradicts the property this stack
+    exists to prove. At 10% the alarm fires on the same signal with a tenth of
+    the blast radius.
+
+    ROLLING replaces tasks in place and uses neither target group pair nor
+    canary shape. LINEAR exists too but would need its own
+    linear_configuration block, which this module does not write.
+
+    This is ECS-NATIVE, not CodeDeploy. The original design used CodeDeploy,
+    which this AWS account cannot subscribe to (SubscriptionRequiredException).
+    The native implementation covers the same ground and removes an entire
+    service, its service role, an appspec file, and the ownership fight where
+    CodeDeploy silently reverted Terraform's view of the service.
   EOT
   type        = string
-  default     = "CodeDeployDefault.ECSCanary10Percent5Minutes"
+  default     = "CANARY"
+
+  validation {
+    condition     = contains(["CANARY", "BLUE_GREEN", "ROLLING"], var.deployment_strategy)
+    error_message = "deployment_strategy must be CANARY, BLUE_GREEN or ROLLING (LINEAR would need a linear_configuration block this module does not write)."
+  }
 }
 
-variable "blue_termination_wait_minutes" {
+variable "canary_percent" {
   description = <<-EOT
-    How long the original (blue) task set keeps running after traffic has
-    shifted. This is the observation window: both task sets are alive and the
-    rollback is a traffic shift back rather than a fresh deployment.
+    Percentage of production traffic sent to the replacement task set before
+    the full shift. Only meaningful when deployment_strategy is CANARY.
   EOT
+  type        = number
+  default     = 10
+}
+
+variable "canary_bake_time_in_minutes" {
+  description = "How long the canary percentage is held before shifting the remainder. This is the window in which the alarms get to object."
   type        = number
   default     = 5
 }
 
-variable "deployment_ready_wait_minutes" {
-  description = "Minutes CodeDeploy waits at the 'ready to reroute' gate before continuing automatically. 0 = continue immediately."
-  type        = number
-  default     = 0
-}
+variable "bake_time_in_minutes" {
+  description = <<-EOT
+    How long the original task set stays running after the full traffic shift.
 
-# --- Observability ----------------------------------------------------------
+    This is the observation window: both task sets are alive, so a rollback is
+    a traffic shift back onto tasks that are already running and already warm,
+    rather than a fresh deployment.
+  EOT
+  type        = number
+  default     = 5
+}
 
 variable "log_retention_days" {
   description = "CloudWatch Logs retention. The default is never-expire, which accrues cost silently."

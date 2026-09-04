@@ -6,7 +6,8 @@
 #   task_execution   used by the ECS agent to pull the image and open log
 #                    streams -- infrastructure, not application, identity
 #   task             the application's own identity. Deliberately empty.
-#   codedeploy       CodeDeploy's service role for ECS blue/green
+#   ecs_infrastructure  assumed by ECS itself to rewrite the load balancer's
+#                    listener rules during a blue/green traffic shift
 # ---------------------------------------------------------------------------
 
 locals {
@@ -15,12 +16,6 @@ locals {
   region     = data.aws_region.current.region
 
   ecs_service_arn = "arn:${local.partition}:ecs:${local.region}:${local.account_id}:service/${aws_ecs_cluster.main.name}/${aws_ecs_service.app.name}"
-
-  codedeploy_app_arn = "arn:${local.partition}:codedeploy:${local.region}:${local.account_id}:application:${aws_codedeploy_app.app.name}"
-  codedeploy_dg_arn  = "arn:${local.partition}:codedeploy:${local.region}:${local.account_id}:deploymentgroup:${aws_codedeploy_app.app.name}/${aws_codedeploy_deployment_group.app.deployment_group_name}"
-  # Only the AWS-managed predefined configs are used, and they are account-wide
-  # rather than per-stack resources.
-  codedeploy_config_arn = "arn:${local.partition}:codedeploy:${local.region}:${local.account_id}:deploymentconfig:*"
 
   oidc_provider_arn = var.create_github_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : data.aws_iam_openid_connect_provider.github[0].arn
 }
@@ -157,34 +152,15 @@ data "aws_iam_policy_document" "github_actions" {
     resources = ["*"]
   }
 
+  # Replaces the three CodeDeploy statements the original design needed. With
+  # ECS-native blue/green the deployment IS an UpdateService call, so there is
+  # no second service to authorize, no application or deployment-group ARN to
+  # scope, and no appspec revision to register.
   statement {
-    sid    = "CodeDeployRevisions"
-    effect = "Allow"
-    actions = [
-      "codedeploy:GetApplication",
-      "codedeploy:GetApplicationRevision",
-      "codedeploy:RegisterApplicationRevision",
-    ]
-    resources = [local.codedeploy_app_arn]
-  }
-
-  statement {
-    sid    = "CodeDeployDeployments"
-    effect = "Allow"
-    actions = [
-      "codedeploy:CreateDeployment",
-      "codedeploy:GetDeployment",
-      "codedeploy:GetDeploymentGroup",
-      "codedeploy:StopDeployment",
-    ]
-    resources = [local.codedeploy_dg_arn]
-  }
-
-  statement {
-    sid       = "CodeDeployConfigs"
+    sid       = "EcsDeploy"
     effect    = "Allow"
-    actions   = ["codedeploy:GetDeploymentConfig"]
-    resources = [local.codedeploy_config_arn]
+    actions   = ["ecs:UpdateService"]
+    resources = [local.ecs_service_arn]
   }
 
   # PassRole is the privilege that matters here. Unscoped, it lets whoever
@@ -309,35 +285,49 @@ resource "aws_iam_role" "task" {
 }
 
 # ---------------------------------------------------------------------------
-# CodeDeploy service role.
+# ECS infrastructure role.
+#
+# Assumed by the ECS service itself -- not by a task, and not by CI. During a
+# blue/green deployment ECS rewrites the load balancer's listener rules to move
+# traffic between the two target groups; this is the identity it does that
+# under. Omit it and the deployment fails immediately, before any task starts.
+#
+# This is the ECS-native replacement for what used to be the CodeDeploy service
+# role, and it is a narrower grant: one AWS-managed policy covering load
+# balancer mutation, rather than the whole ECS blue/green orchestration surface.
 # ---------------------------------------------------------------------------
 
-data "aws_iam_policy_document" "codedeploy_trust" {
+data "aws_iam_policy_document" "ecs_infrastructure_trust" {
   statement {
     effect  = "Allow"
     actions = ["sts:AssumeRole"]
 
     principals {
       type        = "Service"
-      identifiers = ["codedeploy.amazonaws.com"]
+      identifiers = ["ecs.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [local.account_id]
     }
   }
 }
 
-resource "aws_iam_role" "codedeploy" {
-  name               = "${local.name}-codedeploy"
-  description        = "CodeDeploy's service role for ECS blue/green deployments."
-  assume_role_policy = data.aws_iam_policy_document.codedeploy_trust.json
+resource "aws_iam_role" "ecs_infrastructure" {
+  name               = "${local.name}-ecs-infrastructure"
+  description        = "Assumed by ECS to shift traffic between target groups during a blue/green deployment."
+  assume_role_policy = data.aws_iam_policy_document.ecs_infrastructure_trust.json
 
-  tags = { Name = "${local.name}-codedeploy" }
+  tags = { Name = "${local.name}-ecs-infrastructure" }
 }
 
 # The AWS-managed policy is the right call for a service role: its contents are
-# defined by the service that consumes it, and AWS updates it when the ECS
-# blue/green mechanism needs a new permission. Hand-rolling it would mean
-# tracking those changes by hand and finding out about a miss during a
-# deployment.
-resource "aws_iam_role_policy_attachment" "codedeploy" {
-  role       = aws_iam_role.codedeploy.name
-  policy_arn = "arn:${local.partition}:iam::aws:policy/AWSCodeDeployRoleForECS"
+# defined by the service that consumes it, and AWS updates it when the
+# mechanism needs a new permission. Hand-rolling it would mean tracking those
+# changes by hand and finding out about a miss during a deployment.
+resource "aws_iam_role_policy_attachment" "ecs_infrastructure" {
+  role       = aws_iam_role.ecs_infrastructure.name
+  policy_arn = "arn:${local.partition}:iam::aws:policy/AmazonECSInfrastructureRolePolicyForLoadBalancers"
 }

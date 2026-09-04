@@ -47,16 +47,6 @@ output "task_definition_family" {
   value       = aws_ecs_task_definition.app.family
 }
 
-output "codedeploy_application_name" {
-  description = "CodeDeploy application."
-  value       = aws_codedeploy_app.app.name
-}
-
-output "codedeploy_deployment_group_name" {
-  description = "CodeDeploy deployment group."
-  value       = aws_codedeploy_deployment_group.app.deployment_group_name
-}
-
 output "github_actions_role_arn" {
   description = <<-EOT
     Set this as the AWS_DEPLOY_ROLE_ARN repository variable in GitHub. It is
@@ -122,13 +112,18 @@ output "target_group_names" {
   }
 }
 
-output "deployment_config_name" {
-  description = "CodeDeploy traffic-shift strategy in force."
-  value       = aws_codedeploy_deployment_group.app.deployment_config_name
+output "deployment_strategy" {
+  description = "ECS deployment strategy in force, with the canary shape."
+  value = {
+    strategy       = var.deployment_strategy
+    canary_percent = var.canary_percent
+    canary_bake    = "${var.canary_bake_time_in_minutes}m"
+    bake           = "${var.bake_time_in_minutes}m"
+  }
 }
 
 output "rollback_alarm_names" {
-  description = "Alarms wired into CodeDeploy's auto-rollback trigger."
+  description = "Alarms named in the ECS service's deployment rollback trigger."
   value = [
     aws_cloudwatch_metric_alarm.target_5xx.alarm_name,
     aws_cloudwatch_metric_alarm.p99_latency.alarm_name,

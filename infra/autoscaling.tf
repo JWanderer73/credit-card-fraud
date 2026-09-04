@@ -23,6 +23,14 @@ resource "aws_appautoscaling_target" "ecs" {
 
   min_capacity = var.min_capacity
   max_capacity = var.max_capacity
+
+  # Held still for the capacity benchmark and the rollback demonstration; live
+  # for everything else, including the scale-out evidence. See the variable.
+  suspended_state {
+    dynamic_scaling_in_suspended  = var.suspend_autoscaling
+    dynamic_scaling_out_suspended = var.suspend_autoscaling
+    scheduled_scaling_suspended   = var.suspend_autoscaling
+  }
 }
 
 resource "aws_appautoscaling_policy" "cpu" {

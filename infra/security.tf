@@ -74,15 +74,16 @@ resource "aws_vpc_security_group_ingress_rule" "alb_http" {
   to_port     = 80
 }
 
-# The CodeDeploy test listener. Closed by default -- CodeDeploy never connects
-# to it, it only re-points it at the green target group, so leaving :8080 open
-# to the world would add a second internet-facing entry point for no functional
-# gain. Populate test_listener_allowed_cidrs to hand-validate a green task set.
+# The blue/green test listener. Closed by default -- ECS never connects to it,
+# it only re-points its rule at the replacement target group, so leaving :8080
+# open to the world would add a second internet-facing entry point for no
+# functional gain. Populate test_listener_allowed_cidrs to hand-validate a
+# replacement task set before it takes production traffic.
 resource "aws_vpc_security_group_ingress_rule" "alb_test" {
   count = length(var.test_listener_allowed_cidrs)
 
   security_group_id = aws_security_group.alb.id
-  description       = "CodeDeploy test listener, restricted"
+  description       = "Blue/green test listener, restricted"
 
   cidr_ipv4   = var.test_listener_allowed_cidrs[count.index]
   ip_protocol = "tcp"
