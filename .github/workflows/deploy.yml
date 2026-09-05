@@ -161,8 +161,25 @@ jobs:
         id: render
         run: |
           set -euo pipefail
+
+          # Render from the revision the SERVICE IS RUNNING, not the family's
+          # latest.
+          #
+          # "$TASK_FAMILY" resolves to the highest-numbered ACTIVE revision,
+          # which is not the same thing. After any rolled-back deployment the
+          # newest revision is the BROKEN one -- the service reverted, the
+          # revision did not disappear. Rendering from it inherits whatever made
+          # it fail, so the next ordinary deploy ships the previous failure.
+          # Observed exactly that: a clean commit deployed revision 8, which
+          # still carried the fault injections from the rollback demos, and the
+          # circuit breaker rolled it straight back.
+          CURRENT_TD=$(aws ecs describe-services \
+                         --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+                         --query 'services[0].taskDefinition' --output text)
+          echo "Rendering from the live revision: ${CURRENT_TD##*/}"
+
           aws ecs describe-task-definition \
-            --task-definition "$TASK_FAMILY" \
+            --task-definition "$CURRENT_TD" \
             --query taskDefinition --output json > task-definition.json
 
           # describe-task-definition returns read-only server-side fields that
@@ -175,6 +192,25 @@ jobs:
           jq --arg image "${{ steps.image.outputs.uri }}" \
              --arg name  "$CONTAINER_NAME" \
              "$FILTER" task-definition.json > rendered.json
+
+          # Strip fault-injection variables unconditionally before deciding
+          # whether to add any back. Belt and braces alongside rendering from
+          # the live revision: injected variables must never be inherited, and
+          # the two demos proved they otherwise ACCUMULATE -- revision 8 ended
+          # up carrying MODEL_PATH and FAULT_INJECT_PREDICT simultaneously,
+          # neither of which any deployment had asked for.
+          #
+          # Safe to strip both: Terraform's container definition sets only
+          # WORKERS and ORT_INTRA_OP_THREADS, so either of these being present
+          # means a previous run put it there.
+          jq --arg name "$CONTAINER_NAME" '
+            .containerDefinitions |= map(
+              if .name == $name then
+                .environment = ((.environment // [])
+                  | map(select(.name != "FAULT_INJECT_PREDICT"
+                           and .name != "MODEL_PATH")))
+              else . end)' rendered.json > rendered.clean.json
+          mv rendered.clean.json rendered.json
 
           # Failure injection for the rollback demonstration. The two modes
           # exercise DIFFERENT halves of the rollback wiring and are not
