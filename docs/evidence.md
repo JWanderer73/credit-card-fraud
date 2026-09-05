@@ -103,8 +103,41 @@ Tasks in `us-east-1a` and `us-east-1b`, both `HEALTHY`, neither ENI carrying a
 public IP, and a direct connection to `10.0.151.197:8000` from outside the VPC
 times out.
 
-> **Gap:** the multi-AZ *failover* — stop a task, show the ALB serving on — is a
-> separate item from placement and is recorded separately below.
+### Multi-AZ failover
+
+Placement is one claim; surviving the loss of an AZ is another. Autoscaling was
+still suspended, which makes this cleaner rather than harder — suspension stops
+Application Auto Scaling from changing `desiredCount`, but not the ECS *service
+scheduler*, so the replacement is unambiguously the scheduler maintaining
+capacity rather than a scaling activity.
+
+```bash
+# sampling POST /predict every second throughout
+aws ecs stop-task --cluster fraud-api-prod \
+  --task e5daef06929c4519893a03c660440664 \
+  --reason "multi-AZ failover evidence"
+```
+
+```
+18:32:36  stop-task issued            -> DEACTIVATING
+18:32:53  replacement PROVISIONING in us-east-1a   (us-east-1b serving alone)
+18:33:09  ACTIVATING
+18:33:42  RUNNING
+18:33:59  HEALTHY                     -> 83 seconds end to end
+```
+
+**240 requests over four minutes. 240 x 200. Zero failures**
+([capture](evidence/b-failover-traffic.txt) ·
+[task states](evidence/b-failover-events.txt)).
+
+Half the fleet was destroyed and an entire availability zone went empty for
+about 80 seconds without a single client-visible error.
+
+`deregistration_delay = 30` is what makes that true. On the AWS default of 300
+seconds the stopped task sits draining for five minutes while the target group
+slowly stops routing to it, and in-flight requests during that window can fail.
+The setting was chosen to keep deployments from crawling; this is the second
+thing it buys.
 
 ---
 
@@ -223,6 +256,88 @@ you wait out the same unavoidable metric latency.
 
 So the `CANARY` vs `BLUE_GREEN` distinction is not naming pedantry. It is the
 difference between 14% and 100% of requests failing, for the same three minutes.
+
+---
+
+## E · The other rollback shape — and the gap it exposed
+
+`simulate_failure=startup` injects `MODEL_PATH=/srv/models/does-not-exist.onnx`.
+`FraudModel.load` raises in the lifespan handler, the process exits, `/ready`
+never answers, and the replacement task set never passes its health check.
+
+ECS behaved exactly as intended on the traffic side:
+
+```
+(task d977478a...) (port 8000) is unhealthy in (target-group ...-blue)
+                   due to (reason Health checks failed)
+```
+
+Production never wavered — `/ready` returned 200 on every sample throughout.
+Traffic is never routed to a task set that never goes healthy, so this failure
+shape cannot reach a user.
+
+### But it never recovered
+
+```
+01:50:33  deployment started
+02:19:29  ##[error]{"state":"TIMEOUT","reason":"Waiter has timed out"}
+```
+
+**29 minutes, and ECS was still retrying.** Broken task starts, fails its health
+check, gets killed, gets retried, forever. Nothing ended it but the deploy
+workflow's waiter giving up — and a failed workflow does not stop the ECS
+deployment.
+
+The cause is structural, not a misconfiguration. **Both rollback alarms sit on
+the `LoadBalancer` dimension, so they only ever observe traffic that was
+actually routed.** A task set that never goes healthy receives none, so the
+alarms stay `OK` indefinitely while the deployment churns. The alarm mechanism
+that recovers the `runtime` failure in 3m20s is blind to this one by
+construction.
+
+The README had claimed this path "rolls back on deployment failure". That was
+inherited from the CodeDeploy design, which had a deployment timeout, and was
+carried across the migration without re-verification. It was wrong.
+
+### The fix, and the confirmation
+
+```hcl
+deployment_circuit_breaker {
+  enable   = true
+  rollback = true
+}
+```
+
+The circuit breaker watches **consecutive task-launch failures** rather than
+traffic — the only signal available when no traffic exists. AWS fills in
+`resetOnHealthyTask: true`, so transient flakiness does not trip it; only
+sustained inability to launch does.
+
+Re-running the identical failure with it enabled
+([capture](evidence/e-startup-circuitbreaker.txt)):
+
+```
+20:12:xx  deployment started
+20:19:53  PRIMARY back to revision 3, broken revision 7 -> FAILED
+
+(service fraud-api-prod) deployment failed: tasks failed to start.
+(service fraud-api-prod) rolling back to deployment ecs-svc/3225...
+```
+
+**8 minutes to automatic recovery, against 29+ and counting.** `prod=200` on
+every sample of both runs.
+
+### Two mechanisms, two blind spots
+
+| failure shape | detected by | signal | recovery |
+|---|---|---|---|
+| starts, serves errors | 5XX alarm | traffic that *was* routed | 3m20s |
+| never starts | circuit breaker | task launches that failed | 8m |
+
+Neither is redundant. The alarms cannot see a task set that receives no traffic;
+the circuit breaker cannot see a task that is healthy but wrong. Only running
+both failure shapes against the real thing showed that the second one was
+uncovered.
 
 ---
 

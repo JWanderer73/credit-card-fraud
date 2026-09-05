@@ -1,0 +1,16 @@
+18:32:36 STOPPING task e5daef06929c4519893a03c660440664 (us-east-1a)
+DEACTIVATING
+18:32:53 tasks: us-east-1a	PROVISIONING	UNKNOWN us-east-1b	RUNNING	HEALTHY  last15:   15 200 
+18:33:09 tasks: us-east-1a	ACTIVATING	UNKNOWN us-east-1b	RUNNING	HEALTHY  last15:   15 200 
+18:33:26 tasks: us-east-1a	ACTIVATING	UNKNOWN us-east-1b	RUNNING	HEALTHY  last15:   15 200 
+18:33:42 tasks: us-east-1a	RUNNING	UNKNOWN us-east-1b	RUNNING	HEALTHY  last15:   15 200 
+18:33:59 tasks: us-east-1a	RUNNING	HEALTHY us-east-1b	RUNNING	HEALTHY  last15:   15 200 
+18:34:15 tasks: us-east-1a	RUNNING	HEALTHY us-east-1b	RUNNING	HEALTHY  last15:   15 200 
+18:34:32 tasks: us-east-1a	RUNNING	HEALTHY us-east-1b	RUNNING	HEALTHY  last15:   15 200 
+18:34:48 tasks: us-east-1a	RUNNING	HEALTHY us-east-1b	RUNNING	HEALTHY  last15:   15 200 
+18:35:05 tasks: us-east-1a	RUNNING	HEALTHY us-east-1b	RUNNING	HEALTHY  last15:   15 200 
+18:35:21 tasks: us-east-1a	RUNNING	HEALTHY us-east-1b	RUNNING	HEALTHY  last15:   15 200 
+18:35:37 tasks: us-east-1a	RUNNING	HEALTHY us-east-1b	RUNNING	HEALTHY  last15:   15 200 
+18:35:54 tasks: us-east-1a	RUNNING	HEALTHY us-east-1b	RUNNING	HEALTHY  last15:   15 200 
+18:36:10 tasks: us-east-1a	RUNNING	HEALTHY us-east-1b	RUNNING	HEALTHY  last15:   15 200 
+18:36:27 tasks: us-east-1a	RUNNING	HEALTHY us-east-1b	RUNNING	HEALTHY  last15:   15 200 

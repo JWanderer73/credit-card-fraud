@@ -148,6 +148,24 @@ resource "aws_ecs_service" "app" {
     }
   }
 
+  # Covers the failure shape the alarms structurally CANNOT catch.
+  #
+  # Both rollback alarms sit on the LoadBalancer dimension, so they only ever
+  # observe traffic that was actually routed. A task set that never passes its
+  # health check never receives any -- so the alarms stay OK while ECS retries
+  # task placement indefinitely. Measured: a deliberately broken startup churned
+  # for 29 minutes and was still going; nothing ended it but the deploy
+  # workflow's waiter timing out, and that does not stop the ECS deployment.
+  #
+  # The circuit breaker watches consecutive task-launch failures instead of
+  # traffic, which is the only signal available when no traffic exists. It is
+  # what makes "a broken build rolls itself back" true for BOTH failure shapes
+  # rather than just the one that manages to serve errors.
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+
   # What makes the alarms load-bearing rather than decorative: if either
   # breaches while a deployment is in flight, ECS shifts traffic back on its
   # own. Same two alarms and the same LoadBalancer dimension as before -- see

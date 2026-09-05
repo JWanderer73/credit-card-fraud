@@ -635,10 +635,20 @@ otherwise carry — one fewer resource, and one fewer thing to forget to destroy
 The evidence worth capturing is not that the mechanism exists but that it works.
 **There are two rollback paths and they are not interchangeable:**
 
-| broken how | what ECS sees | what rolls it back |
-|---|---|---|
-| container will not start | the replacement task set never passes the ALB health check on `/ready`, so **traffic never shifts** | the deployment fails and is rolled back |
-| container starts, `/ready` returns 200, inference returns 500 | the task set looks healthy, **the canary shifts 10% of traffic**, then real requests fail | the 5XX alarm breaches and the `alarms` rollback fires |
+| broken how | what ECS sees | what rolls it back | measured |
+|---|---|---|---|
+| container will not start | the replacement task set never passes the ALB health check on `/ready`, so **traffic never shifts** | the **deployment circuit breaker** — consecutive task-launch failures | 8 min |
+| container starts, `/ready` returns 200, inference returns 500 | the task set looks healthy, **the canary shifts 10% of traffic**, then real requests fail | the **5XX alarm** breaching the `alarms` rollback | 3m20s |
+
+**Two mechanisms, because each is blind to the other's failure.** The alarms sit
+on the `LoadBalancer` dimension, so they only ever observe traffic that was
+actually routed — a task set that never goes healthy receives none, and the
+alarms stay `OK` while ECS retries placement forever. Measured before the
+circuit breaker was enabled: **29 minutes of churn and still going**, ended only
+by the deploy workflow's waiter timing out, which does not stop the ECS
+deployment. Conversely the circuit breaker watches task launches, so it cannot
+see a task that starts perfectly and answers every request wrongly. Neither
+covers both.
 
 The first is the boring one: nothing bad ever reaches a user, but the alarms and
 the `alarm_configuration` block are never touched. It shows that the load
