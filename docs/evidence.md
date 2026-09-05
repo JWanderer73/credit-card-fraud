@@ -505,13 +505,57 @@ setpoint when it is really a property of the load generator.
 
 ### Scale-in
 
-Deliberately not waited out: target tracking scales in only after **15
-consecutive minutes** below target, with a 300-second cooldown between actions.
-That asymmetry is intentional — capacity is added readily and removed
-reluctantly, because shedding too eagerly turns a traffic dip into a cold-start
-storm when it returns. It is also why this step runs last: every earlier step
-wanted a clean 2-task baseline, and reaching one from 6 tasks costs a quarter of
-an hour.
+```
+scale-out                          scale-in
+20:57:35  ->4  (+2)                21:51:38  ->5  (-1)
+21:03:35  ->6  (+2)                21:57:38  ->4  (-1)
+                                   22:03:38  ->3  (-1)
+                                   22:09:38  ->2  (-1)
+```
+
+[Full timeline](evidence/f-scalein.txt). Three things stand out.
+
+**The step sizes are asymmetric.** Scale-out moved two tasks per action;
+scale-in moves one. Target tracking is willing to overshoot upward and refuses
+to overshoot downward — it would rather pay for idle capacity than remove
+something still needed.
+
+**Every action is exactly six minutes apart**, in both directions: the
+300-second cooldown plus a 60-second evaluation period. So the *cadence* is
+identical; only the trigger and the step size differ.
+
+**The trigger thresholds are what create the asymmetry**, and they are visible
+on the alarms target tracking creates for itself:
+
+```
+AlarmHigh  evaluation_periods=3   threshold=50.0   -> scale out
+AlarmLow   evaluation_periods=15  threshold=45.0   -> scale in
+```
+
+Three minutes above target to add capacity; fifteen below to remove it. Combined
+with the single-task step, returning 6 -> 2 took **18 minutes of scaling actions**
+against 6 minutes to go 2 -> 6.
+
+### A deployment blocks scaling
+
+Load stopped at 21:07 and `AlarmLow` was in `ALARM` well before 21:39, but the
+first scale-in did not fire until **21:51:38** — within seconds of the canary
+deployment completing at ~21:51.
+
+That is not a coincidence, and it is direct evidence for the reason the earlier
+steps ran with `suspend_autoscaling = true`: Application Auto Scaling and the
+deployment controller both act on the same service, and scaling activity is held
+while a deployment is in flight. A rollback demonstration run at 6 tasks would
+have had scaling actions queued behind it, making it genuinely ambiguous whether
+the alarm or the interference caused what followed.
+
+### A correction
+
+While this was running, `AlarmLow` was observed in state `OK` at 21:39 and that
+was attributed to ONNX session loading during the deployment raising CPU. The
+data does not support it — CPU held at ~3% throughout. The likelier explanation
+is simply that the alarm had not yet accumulated 15 datapoints since the load
+stopped: it was filling its evaluation window, not waiting for CPU to fall.
 
 ---
 
