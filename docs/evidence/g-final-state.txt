@@ -1,0 +1,45 @@
+=== final service state ===
+{
+    "TaskDef": "arn:aws:ecs:us-east-1:589158200888:task-definition/fraud-api-prod:9",
+    "Desired": 2,
+    "Running": 2
+}
+
+=== alarms at teardown ===
+--------------------------------------------------------------------------------
+|                                DescribeAlarms                                |
++---------------------------------------+-----------------------------+--------+
+|                 Alarm                 |           Metric            | State  |
++---------------------------------------+-----------------------------+--------+
+|  fraud-api-prod-p99-latency           |  TargetResponseTime         |  OK    |
+|  fraud-api-prod-target-5xx            |  HTTPCode_Target_5XX_Count  |  OK    |
+|  fraud-api-prod-unhealthy-hosts-blue  |  UnHealthyHostCount         |  OK    |
+|  fraud-api-prod-unhealthy-hosts-green |  UnHealthyHostCount         |  OK    |
++---------------------------------------+-----------------------------+--------+
+=== log streams ===
+ecs/fraud-api/8aa40813fc4f462da40a63c421d63128
+ecs/fraud-api/024d7f3eca4f4018bbe8ae6102ac40a9
+ecs/fraud-api/fa4782cc59454abc9d645f915dc640df
+ecs/fraud-api/b779fd86952045bc82c01b2123013b95
+ecs/fraud-api/6edb48ad37fb4fddadcddf9cbee9e1a7
+None
+
+=== a real application log line ===
+
+aws: [ERROR]: An error occurred (ResourceNotFoundException) when calling the GetLogEvents operation: The specified log stream does not exist.
+
+=== ALB access logs landed in S3? ===
+2026-09-04 22:10:08        430 fraud-api-prod/AWSLogs/589158200888/elasticloadbalancing/us-east-1/2026/09/05/589158200888_elasticloadbalancing_us-east-1_app.fraud-api-prod.ed0f01df4c3cc850_20260905T0510Z_18.214.123.96_64ib7cu0.log.gz
+2026-09-04 22:20:08        224 fraud-api-prod/AWSLogs/589158200888/elasticloadbalancing/us-east-1/2026/09/05/589158200888_elasticloadbalancing_us-east-1_app.fraud-api-prod.ed0f01df4c3cc850_20260905T0520Z_18.214.123.96_1uc3n7f6.log.gz
+2026-09-04 22:30:08       1242 fraud-api-prod/AWSLogs/589158200888/elasticloadbalancing/us-east-1/2026/09/05/589158200888_elasticloadbalancing_us-east-1_app.fraud-api-prod.ed0f01df4c3cc850_20260905T0530Z_18.214.123.96_5td8ztsy.log.gz
+objects: 119
+
+=== application log lines (retry) ===
+INFO:     10.0.20.249:58568 - "GET /ready HTTP/1.1" 200 OK
+INFO:     10.0.6.226:34076 - "GET /ready HTTP/1.1" 200 OK
+INFO:     10.0.20.249:53170 - "GET /ready HTTP/1.1" 200 OK
+INFO:     127.0.0.1:47044 - "GET /health HTTP/1.1" 200 OK
+INFO:     10.0.6.226:54596 - "GET /ready HTTP/1.1" 200 OK
+INFO:     10.0.20.249:62364 - "GET /ready HTTP/1.1" 200 OK
+INFO:     10.0.6.226:11162 - "GET /ready HTTP/1.1" 200 OK
+INFO:     10.0.20.249:20648 - "GET /ready HTTP/1.1" 200 OK

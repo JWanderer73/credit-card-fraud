@@ -653,6 +653,78 @@ budget notification — Terraform has no memory of a `-var` between runs.
 
 ---
 
-## Still outstanding
+## G · Teardown
 
-- `terraform destroy`, and the budget confirming spend returned to zero
+Final state captured first — it does not survive
+([`g-final-state.txt`](evidence/g-final-state.txt)): revision 9 at 2/2 tasks,
+all four alarms `OK`, five log streams, and **119 ALB access log objects in S3**.
+
+That last number matters more than it looks. The access-log bucket policy is the
+setting most likely to fail *silently*: which principal may write depends on how
+old the region is, and getting it wrong produces no error at all, just an empty
+bucket. It is not empty.
+
+The application log lines are the other quiet confirmation:
+
+```
+INFO:  10.0.20.249:58568 - "GET /ready HTTP/1.1" 200 OK     <- ALB node, public subnet
+INFO:  10.0.6.226:34076  - "GET /ready HTTP/1.1" 200 OK     <- ALB node, other AZ
+INFO:  127.0.0.1:47044   - "GET /health HTTP/1.1" 200 OK    <- container healthCheck
+```
+
+Two health-check paths, both working: the ALB polling `/ready` from the public
+subnets, and the task definition's own `/health` check on localhost.
+
+```bash
+terraform -chdir=infra destroy -var-file=envs/prod.tfvars \
+  -var budget_notification_email=<address>
+```
+
+```
+Destroy complete! Resources: 61 destroyed.
+```
+
+**One pass, no errors.** `force_delete` on the ECR repository and
+`force_destroy` on the access-log bucket are what made that true — without them
+`destroy` stalls on a non-empty repository or a bucket holding 119 objects, and
+a half-destroyed stack leaves precisely the expensive resources standing.
+
+### Orphan sweep
+
+Terraform reporting success is not the same as AWS having stopped billing,
+especially in a stack where some changes were made out-of-band. Verified
+directly:
+
+```
+ALBs 0 · Target groups 0 · VPC endpoints 0 · NAT gateways 0
+ECS clusters 0 · ECS services 0 · ECR repos 0 · Non-default VPCs 0
+fraud-api IAM roles 0 · Alarms 0 · Log groups 0
+```
+
+The `aws ecs update-service` call made during the CANARY fix left nothing
+behind; Terraform's state stayed authoritative throughout.
+
+### What survives, deliberately
+
+- `fraud-api-tfstate-589158200888` — the state bucket, outside Terraform,
+  fractions of a cent
+- This repository: the Terraform, this evidence log, and the raw captures
+
+The ECR images went with the stack. That is the trade `force_delete` buys: one
+clean teardown command, at the cost of the first `apply` after a rebuild needing
+a workflow run before the service can serve. Deliberate, not accidental.
+
+---
+
+## Cost, actually incurred
+
+The stack ran for roughly seven hours at ~$0.13/hr, higher in the stretches at
+4-6 tasks — call it **$1.00-1.25 total**, against $100+ of Free Plan credits.
+
+Two things worth knowing about reading this back in the console:
+
+- **Billing data lags 6-24 hours**, so the figure looked like $0 throughout.
+  Absence of visible charges was reporting lag, not absence of spend.
+- **Nothing in this stack was free-tier eligible.** PrivateLink and Fargate have
+  no free tier under any plan, and the new Free Plan has no 12-month ALB
+  allowance. The credits paid for it; the free tier did not.
