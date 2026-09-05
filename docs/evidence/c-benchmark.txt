@@ -1,0 +1,120 @@
+=== concurrency 2 (total 8) ===
+Running single mode for 60.0s: 4 client process(es) x 2 concurrent...
+
+==============================================================================
+BENCHMARK RESULTS
+==============================================================================
+
+SINGLE  (single prediction per request)
+  load generators    4 processes x 2 concurrent = 8 in flight
+  duration           60.07 s
+  requests           6,052   errors: 0
+  requests/sec       100.7
+  predictions/sec    100.7
+  latency ms         p50=77.32  p95=86.42  p99=121.37  max=378.3
+
+------------------------------------------------------------------------------
+HEADLINE (quote this): 101 real-time predictions/sec
+  one transaction per HTTP request, p99 121.37 ms
+------------------------------------------------------------------------------
+
+=== concurrency 4 (total 16) ===
+Running single mode for 60.0s: 4 client process(es) x 4 concurrent...
+
+==============================================================================
+BENCHMARK RESULTS
+==============================================================================
+
+SINGLE  (single prediction per request)
+  load generators    4 processes x 4 concurrent = 16 in flight
+  duration           60.07 s
+  requests           12,343   errors: 0
+  requests/sec       205.5
+  predictions/sec    205.5
+  latency ms         p50=76.68  p95=84.61  p99=106.75  max=383.09
+
+------------------------------------------------------------------------------
+HEADLINE (quote this): 206 real-time predictions/sec
+  one transaction per HTTP request, p99 106.75 ms
+------------------------------------------------------------------------------
+
+=== concurrency 8 (total 32) ===
+Running single mode for 60.0s: 4 client process(es) x 8 concurrent...
+
+==============================================================================
+BENCHMARK RESULTS
+==============================================================================
+
+SINGLE  (single prediction per request)
+  load generators    4 processes x 8 concurrent = 32 in flight
+  duration           60.08 s
+  requests           24,659   errors: 0
+  requests/sec       410.5
+  predictions/sec    410.5
+  latency ms         p50=76.4  p95=85.51  p99=118.0  max=431.95
+
+------------------------------------------------------------------------------
+HEADLINE (quote this): 410 real-time predictions/sec
+  one transaction per HTTP request, p99 118.0 ms
+------------------------------------------------------------------------------
+
+=== concurrency 16 (total 64) ===
+Running single mode for 60.0s: 4 client process(es) x 16 concurrent...
+
+==============================================================================
+BENCHMARK RESULTS
+==============================================================================
+
+SINGLE  (single prediction per request)
+  load generators    4 processes x 16 concurrent = 64 in flight
+  duration           60.07 s
+  requests           47,988   errors: 0
+  requests/sec       798.8
+  predictions/sec    798.8
+  latency ms         p50=76.43  p95=99.11  p99=179.34  max=397.74
+
+------------------------------------------------------------------------------
+HEADLINE (quote this): 799 real-time predictions/sec
+  one transaction per HTTP request, p99 179.34 ms
+------------------------------------------------------------------------------
+
+=== concurrency 32 (total 128) ===
+Running single mode for 60.0s: 4 client process(es) x 32 concurrent...
+
+==============================================================================
+BENCHMARK RESULTS
+==============================================================================
+
+SINGLE  (single prediction per request)
+  load generators    4 processes x 32 concurrent = 128 in flight
+  duration           60.13 s
+  requests           70,693   errors: 0
+  requests/sec       1,175.8
+  predictions/sec    1,175.8
+  latency ms         p50=95.3  p95=195.85  p99=323.8  max=1794.23
+
+------------------------------------------------------------------------------
+HEADLINE (quote this): 1,176 real-time predictions/sec
+  one transaction per HTTP request, p99 323.8 ms
+------------------------------------------------------------------------------
+
+=== concurrency 64 (total 256) ===
+Running single mode for 60.0s: 4 client process(es) x 64 concurrent...
+
+==============================================================================
+BENCHMARK RESULTS
+==============================================================================
+
+SINGLE  (single prediction per request)
+  load generators    4 processes x 64 concurrent = 256 in flight
+  duration           90.04 s
+  requests           24,295   errors: 4
+  requests/sec       269.8
+  predictions/sec    269.8
+  latency ms         p50=272.6  p95=2347.16  p99=3835.3  max=6528.39
+
+------------------------------------------------------------------------------
+HEADLINE (quote this): 270 real-time predictions/sec
+  one transaction per HTTP request, p99 3835.3 ms
+------------------------------------------------------------------------------
+

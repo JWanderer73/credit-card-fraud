@@ -1,0 +1,19 @@
+Running single mode for 2400.0s: 2 client process(es) x 2 concurrent...
+
+==============================================================================
+BENCHMARK RESULTS
+==============================================================================
+
+SINGLE  (single prediction per request)
+  load generators    2 processes x 2 concurrent = 4 in flight
+  duration           2400.04 s
+  requests           120,871   errors: 901
+  requests/sec       50.4
+  predictions/sec    50.4
+  latency ms         p50=76.99  p95=83.51  p99=120.45  max=2662.63
+
+------------------------------------------------------------------------------
+HEADLINE (quote this): 50 real-time predictions/sec
+  one transaction per HTTP request, p99 120.45 ms
+------------------------------------------------------------------------------
+

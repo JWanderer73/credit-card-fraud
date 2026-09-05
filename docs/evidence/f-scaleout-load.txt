@@ -6,14 +6,14 @@ BENCHMARK RESULTS
 
 SINGLE  (single prediction per request)
   load generators    4 processes x 32 concurrent = 128 in flight
-  duration           780.19 s
-  requests           1,065,468   errors: 0
-  requests/sec       1,365.7
-  predictions/sec    1,365.7
-  latency ms         p50=78.03  p95=159.32  p99=354.28  max=2938.49
+  duration           780.07 s
+  requests           1,036,356   errors: 0
+  requests/sec       1,328.5
+  predictions/sec    1,328.5
+  latency ms         p50=79.39  p95=157.87  p99=311.48  max=3271.38
 
 ------------------------------------------------------------------------------
-HEADLINE (quote this): 1,366 real-time predictions/sec
-  one transaction per HTTP request, p99 354.28 ms
+HEADLINE (quote this): 1,328 real-time predictions/sec
+  one transaction per HTTP request, p99 311.48 ms
 ------------------------------------------------------------------------------
 
