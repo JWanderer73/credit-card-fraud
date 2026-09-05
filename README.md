@@ -714,8 +714,11 @@ OIDC provider is for. The one value the repository holds is
 because a role ARN is useless without an OIDC token whose `sub` matches the
 trust policy.
 
-The rest of the evidence is captured by hand, and the **order is not
-arbitrary**. Two constraints drive it:
+Everything below has been run against a real account; the commands, outputs and
+measured numbers are recorded in **[`docs/evidence.md`](docs/evidence.md)**,
+which is the durable artifact once the stack is destroyed.
+
+The **order is not arbitrary**. Two constraints drive it:
 
 - The alarm thresholds gate every deployment, so they have to be set from a
   measurement rather than guessed — which means the benchmark comes before the
@@ -858,12 +861,29 @@ terraform -chdir=infra apply -var-file=envs/prod.tfvars \
 
 ALB=$(terraform -chdir=infra output -raw alb_dns_name)
 
-# raise concurrency until the two tasks saturate; keep each run short
-python scripts/benchmark.py --url "http://$ALB" --mode single \
-  --processes 4 --concurrency 4 --duration 90 --json-out bench-c4.json
-python scripts/benchmark.py --url "http://$ALB" --mode single \
-  --processes 4 --concurrency 8 --duration 90 --json-out bench-c8.json
+# sweep until the two tasks saturate; keep each run short so a scale-out
+# could not fire even if autoscaling were live (it needs 3 sustained minutes)
+for C in 2 4 8 16 32 64; do
+  python scripts/benchmark.py --url "http://$ALB" --mode single \
+    --processes 4 --concurrency $C --duration 60 --warmup 5
+done
+
+# the number that actually sets the CPU setpoint -- the same metric target
+# tracking consumes, published per-service without Container Insights
+aws cloudwatch get-metric-statistics --namespace AWS/ECS \
+  --metric-name CPUUtilization \
+  --dimensions Name=ClusterName,Value=fraud-api-prod \
+               Name=ServiceName,Value=fraud-api-prod \
+  --start-time "$(date -u -v-40M '+%Y-%m-%dT%H:%M:%SZ')" \
+  --end-time "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+  --period 60 --statistics Average Maximum --output table
 ```
+
+**Expect the first few rows to measure your network rather than the service.**
+Throughput that doubles exactly with concurrency while p50 stays flat means
+nothing is queueing. Keep raising it until p50 climbs — that is the only point
+where the RPS number says anything about Fargate. The measured curve is in
+[`docs/evidence.md`](docs/evidence.md#c--per-task-capacity-measured-through-the-alb).
 
 Pass `budget_notification_email` on **every** apply from here on, or the budget
 notification is dropped and re-created on the next one that includes it.
@@ -923,10 +943,20 @@ done
 ```
 
 ```bash
-# terminal 3
-gh workflow run deploy.yml -f simulate_failure=runtime
+# terminal 3 -- note the image_tag
+gh workflow run deploy.yml \
+  -f image_tag="$(git rev-parse HEAD)" \
+  -f simulate_failure=runtime
 gh run watch "$(gh run list --workflow=deploy.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
 ```
+
+**`image_tag` is not optional here**, and leaving it out is the mistake that
+kills the demo before it starts. Without it the workflow rebuilds and pushes the
+current git SHA — but that image is already in ECR, the repository is
+`IMMUTABLE`, and the push is rejected. The immutability guarantee working
+exactly as intended. Passing the tag skips the build entirely, which also makes
+the demo cleaner: identical bytes to what is already serving, one environment
+override different.
 
 The shot worth capturing is terminal 2: a wall of `200`s, then a minute or two
 of `200 200 500 200` as the canary puts 10% of traffic on the broken task set,
@@ -1173,6 +1203,8 @@ true at Phase 3 (2 AZs, ≥2 tasks); Phases 1–2 do not support it on their own
 │   └── envs/prod.tfvars
 ├── scripts/bootstrap-state.sh    # one-time: state bucket + backend.hcl
 ├── scripts/verify-deployment.sh  # asserts the security claims against AWS
+├── docs/evidence.md        # what was actually run against AWS, and its output
+├── docs/evidence/          # raw traffic captures and verification output
 ├── .github/workflows/ci.yml
 └── .github/workflows/deploy.yml  # OIDC → build → push → canary deploy
 ```

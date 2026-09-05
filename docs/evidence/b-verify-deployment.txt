@@ -1,0 +1,73 @@
+
+1. The API answers through the load balancer
+  GET http://fraud-api-prod-1157734690.us-east-1.elb.amazonaws.com/ready -> {"status":"ready","model_loaded":true,"threshold":0.7564894556999207}
+  PASS  /ready returns ready through the ALB
+  PASS  /docs served through the ALB
+
+2. Task ingress is reachable only from the ALB's security group
+--------------------------------------------------------------------------------------------------------------------------------------------------------------
+|                                                                 DescribeSecurityGroupRules                                                                 |
++------+-----------------------------------------------------------------------+------------+-------+--------------+--------+-----------------------+--------+
+| CIDR |                                 Desc                                  | Direction  | From  | PrefixList   | Proto  |       SourceSG        |  To    |
++------+-----------------------------------------------------------------------+------------+-------+--------------+--------+-----------------------+--------+
+|  None|  HTTPS to the interface VPC endpoints (ECR API/DKR, CloudWatch Logs)  |  True      |  443  |  None        |  tcp   |  sg-03e009c7498fa37cb |  443   |
+|  None|  HTTPS to S3 via the gateway endpoint -- ECR image layers             |  True      |  443  |  pl-63a5400a |  tcp   |  None                 |  443   |
+|  None|  Application traffic from the ALB only                                |  False     |  8000 |  None        |  tcp   |  sg-07fccc93cde938d43 |  8000  |
++------+-----------------------------------------------------------------------+------------+-------+--------------+--------+-----------------------+--------+
+  PASS  no CIDR-based ingress rule on the task security group
+  PASS  the only ingress source is sg-07fccc93cde938d43 (the ALB)
+
+3. Task subnets have no route to the internet
+  route table rtb-00b9a091f015bedab:
+--------------------------------------------------------------------
+|                        DescribeRouteTables                       |
++-------------+--------------+---------+---------------------------+
+| Destination | PrefixList   |  State  |          Target           |
++-------------+--------------+---------+---------------------------+
+|  10.0.0.0/16|  None        |  active |  local                    |
+|  None       |  pl-63a5400a |  active |  vpce-08b377ef28ad3c65d   |
++-------------+--------------+---------+---------------------------+
+  PASS  rtb-00b9a091f015bedab has no 0.0.0.0/0 route
+  route table rtb-0be8d5e911b638d1b:
+--------------------------------------------------------------------
+|                        DescribeRouteTables                       |
++-------------+--------------+---------+---------------------------+
+| Destination | PrefixList   |  State  |          Target           |
++-------------+--------------+---------+---------------------------+
+|  10.0.0.0/16|  None        |  active |  local                    |
+|  None       |  pl-63a5400a |  active |  vpce-08b377ef28ad3c65d   |
++-------------+--------------+---------+---------------------------+
+  PASS  rtb-0be8d5e911b638d1b has no 0.0.0.0/0 route
+  PASS  no NAT gateway exists in the VPC
+
+4. Tasks have no public IP and are spread across availability zones
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+|                                                                              DescribeTasks                                                                             |
++------------+------------------------+----------+---------------+----------+--------------------------------------------------------------------------------------------+
+|     AZ     |          ENI           | Health   |   PrivateIP   | Status   |                                           Task                                             |
++------------+------------------------+----------+---------------+----------+--------------------------------------------------------------------------------------------+
+|  us-east-1b|  eni-098faa0af4f0b9a43 |  HEALTHY |  10.0.154.28  |  RUNNING |  arn:aws:ecs:us-east-1:589158200888:task/fraud-api-prod/929e8860ddd0404e9337803714dad53c   |
+|  us-east-1a|  eni-09dee9b1022210f34 |  HEALTHY |  10.0.137.138 |  RUNNING |  arn:aws:ecs:us-east-1:589158200888:task/fraud-api-prod/e5daef06929c4519893a03c660440664   |
++------------+------------------------+----------+---------------+----------+--------------------------------------------------------------------------------------------+
+  PASS  no task ENI has a public IP
+  PASS  tasks running across 2 availability zones
+  attempting a direct connection to 10.0.154.28:8000 (expected to fail)
+  PASS  task 10.0.154.28 is unreachable except through the ALB
+
+5. Alarms and logs
+--------------------------------------------------------------------------------
+|                                DescribeAlarms                                |
++---------------------------------------+-----------------------------+--------+
+|                 Alarm                 |           Metric            | State  |
++---------------------------------------+-----------------------------+--------+
+|  fraud-api-prod-p99-latency           |  TargetResponseTime         |  OK    |
+|  fraud-api-prod-target-5xx            |  HTTPCode_Target_5XX_Count  |  OK    |
+|  fraud-api-prod-unhealthy-hosts-blue  |  UnHealthyHostCount         |  OK    |
+|  fraud-api-prod-unhealthy-hosts-green |  UnHealthyHostCount         |  OK    |
++---------------------------------------+-----------------------------+--------+
+  PASS  no alarm is in ALARM state
+  PASS  application logs present in /ecs/fraud-api-prod
+  most recent streams: ecs/fraud-api/ea71485a56b84829a6709eeeb2612baf	ecs/fraud-api/e5daef06929c4519893a03c660440664	ecs/fraud-api/055df225bbff434d89f4f581257b422c
+None
+
+All checks passed.

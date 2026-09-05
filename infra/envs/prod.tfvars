@@ -21,9 +21,20 @@ desired_count = 2
 min_capacity  = 2
 max_capacity  = 6
 
-# Placeholder. Replace with a value derived from the Fargate benchmark -- see
-# "Measuring per-task capacity" in the README.
-cpu_target_utilization = 60
+# MEASURED, not guessed. Benchmarked through the ALB at 2 tasks x 0.5 vCPU:
+#
+#   in flight    RPS     p50     p99      ECS CPUUtilization
+#   -------------------------------------------------------
+#          64     815    76ms   141ms     ~35%
+#         128   1,309    86ms   306ms     ~66%
+#         256     418*  222ms  3,692ms    ~94-100%   * collapsed
+#
+# ~20 RPS per 1% CPU, so 100% is roughly 2,000 RPS across the pair. The cliff
+# between 66% and 94% is one doubling of load, and scale-out needs ~3 minutes
+# of sustained breach plus ~1 minute of task start before new capacity lands.
+# 50% (~1,000 RPS) leaves a 2x margin to cover that reaction time; 60% leaves
+# only 1.5x, which is thinner than the cliff is steep.
+cpu_target_utilization = 50
 
 log_retention_days = 7
 container_insights = false
@@ -43,6 +54,17 @@ bake_time_in_minutes        = 5
 # Closed. Set to ["<your.ip>/32"] to curl the green task set during the bake
 # window; CodeDeploy itself does not need this open.
 test_listener_allowed_cidrs = []
+
+# Also measured. Healthy p99 ranged 98-306ms across every load level; the only
+# time it left that band was congestive collapse at 3.7s. 1.0s sits ~3x above
+# the worst healthy reading and ~4x below collapse, so it distinguishes the two
+# without firing on normal traffic.
+alarm_p99_latency_seconds = 1.0
+
+# Zero 5XX responses across ~190,000 requests, including at collapse -- the
+# service queues rather than erroring. Any 5XX is therefore anomalous, and 10
+# in a minute is a floor that only a genuinely broken build reaches.
+alarm_5xx_threshold = 10
 
 github_repo   = "JWanderer73/credit-card-fraud"
 github_branch = "main"

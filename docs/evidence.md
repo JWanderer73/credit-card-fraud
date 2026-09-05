@@ -1,0 +1,266 @@
+# Phase 3 — evidence log
+
+What was actually run against AWS account `589158200888` in `us-east-1`, with the
+output it produced. The stack is destroyed after capture, so **this file and the
+Terraform are the artifact** — everything below was reproducible from
+[the runbook](../README.md#the-evidence-runbook) at the time of writing, and
+where the runbook was wrong, this log says so.
+
+Raw captures live in [`evidence/`](evidence/).
+
+---
+
+## A · Stand it up
+
+```bash
+export AWS_REGION=us-east-1
+./scripts/bootstrap-state.sh
+terraform -chdir=infra init -backend-config=backend.hcl
+terraform -chdir=infra apply -var-file=envs/prod.tfvars \
+  -var bootstrap=true -var budget_notification_email=<address>
+gh variable set AWS_DEPLOY_ROLE_ARN \
+  --body "$(terraform -chdir=infra output -raw github_actions_role_arn)"
+gh workflow run deploy.yml --ref main
+terraform -chdir=infra apply -var-file=envs/prod.tfvars \
+  -var budget_notification_email=<address>
+```
+
+**Result:** 59 resources on the bootstrap apply, 2 more (autoscaling target and
+policy) on the second. Service reached `runningCount: 2` about 25 seconds after
+the second apply.
+
+```
+$ curl -s http://fraud-api-prod-1157734690.us-east-1.elb.amazonaws.com/ready
+{"status":"ready","model_loaded":true,"threshold":0.7564894556999207}
+
+$ curl -s -X POST .../predict -H 'content-type: application/json' -d @payload.json
+{"fraud_probability":0.9996738433837891,"is_fraud":true,"threshold_used":0.7564894556999207}
+```
+
+That probability is the same fixture row the ONNX parity tests use, so the model
+serving on Fargate agrees with the one trained locally, end to end through the
+load balancer.
+
+### Two things that did not go to plan
+
+**CodeDeploy is unavailable on this account.** `CreateApplication` — and even a
+read-only `ListApplications` — return `SubscriptionRequiredException`, while
+CodeBuild, SNS, Lambda, CloudFormation, CodePipeline and Application Auto
+Scaling all work. The stack was migrated to ECS-native canary deployments;
+see the [README](../README.md#blue-green-deployments-with-automatic-rollback).
+
+**The OIDC trust policy matched nothing**, failing with a bare
+`Not authorized to perform sts:AssumeRoleWithWebIdentity`. GitHub issues an
+immutable subject carrying numeric owner and repository IDs. The received value
+is visible only in CloudTrail:
+
+```
+$ aws cloudtrail lookup-events --region us-east-1 \
+    --lookup-attributes AttributeKey=EventName,AttributeValue=AssumeRoleWithWebIdentity
+
+sub: repo:JWanderer73@184721915/credit-card-fraud@1356551646:ref:refs/heads/main
+     ^^^^^^^^^^^^^^^^^^^^^^^^^ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+documented form: repo:JWanderer73/credit-card-fraud:ref:refs/heads/main
+```
+
+---
+
+## B · Security evidence
+
+```bash
+./scripts/verify-deployment.sh
+```
+
+Full output: [`evidence/b-verify-deployment.txt`](evidence/b-verify-deployment.txt).
+All checks passed. The two load-bearing extracts:
+
+**No route to the internet.** Both private route tables, in full:
+
+```
+Destination    PrefixList     Target
+10.0.0.0/16    -              local
+-              pl-63a5400a    vpce-08b377ef28ad3c65d
+```
+
+Two routes. Local VPC traffic, and S3 via the gateway endpoint. No `0.0.0.0/0`
+entry of any kind, and `describe-nat-gateways` returns zero — while the tasks
+are still pulling images and shipping logs.
+
+**Reachable only through the ALB.** The task security group's rules:
+
+```
+ingress  :8000  <- sg-07fccc93cde938d43  (the ALB)      no CIDR anywhere
+egress   :443   -> sg-03e009c7498fa37cb  (VPC endpoints)
+egress   :443   -> pl-63a5400a           (S3 prefix list, image layers)
+```
+
+That last rule is the one the plan's first draft got wrong. A gateway endpoint
+is a route, not an ENI, so its traffic is not covered by the egress rule to the
+endpoint security group — locking egress down to `endpoint_sg` alone reproduces
+the exact hung-image-pull the S3 endpoint exists to prevent.
+
+Tasks in `us-east-1a` and `us-east-1b`, both `HEALTHY`, neither ENI carrying a
+public IP, and a direct connection to `10.0.151.197:8000` from outside the VPC
+times out.
+
+> **Gap:** the multi-AZ *failover* — stop a task, show the ALB serving on — is a
+> separate item from placement and is recorded separately below.
+
+---
+
+## C · Per-task capacity, measured through the ALB
+
+Autoscaling suspended first, so a scale-out could not move the denominator:
+
+```bash
+terraform -chdir=infra apply -var-file=envs/prod.tfvars \
+  -var budget_notification_email=<address> -var suspend_autoscaling=true
+
+for C in 2 4 8 16 32 64; do
+  python scripts/benchmark.py --url "http://$ALB" --mode single \
+    --processes 4 --concurrency $C --duration 60 --warmup 5
+done
+```
+
+2 tasks x 0.5 vCPU. CPU column is `AWS/ECS CPUUtilization`, 1-minute average —
+the same metric target tracking consumes.
+
+| in flight | RPS | p50 | p95 | p99 | CPU |
+|---|---|---|---|---|---|
+| 8 | 102 | 77 ms | 84 ms | 98 ms | ~3% |
+| 16 | 207 | 76 ms | 83 ms | 106 ms | ~3% |
+| 32 | 413 | 76 ms | 84 ms | 113 ms | ~13% |
+| 64 | 815 | 76 ms | 87 ms | 141 ms | ~35% |
+| **128** | **1,309** | 86 ms | 145 ms | 306 ms | **~66%** |
+| 256 | 418 | 222 ms | 2,262 ms | 3,692 ms | ~94-100% |
+
+**The first three rows measure the network, not the service.** Throughput
+doubles exactly with concurrency while p50 stays pinned at ~76 ms — latency that
+will not degrade under 4x the load means nothing is queueing. Little's Law
+closes it: `32 / 0.0765 s = 418` against 413 measured. The ~76 ms is round-trip
+to Virginia, against 6.7 ms p99 on loopback locally.
+
+Real saturation appears at 128 in flight: **1,309 predictions/sec, p99 306 ms**,
+on 1.0 vCPU total. At 256 it does not degrade, it collapses — throughput falls
+to a third while p99 reaches 3.7 s.
+
+Against the local 4,120/s on an M1: ~1,300 RPS per vCPU here versus ~2,000 per
+core locally. Same order, so ONNX Runtime is behaving consistently; the gap is
+core count and clock, not the deployment.
+
+---
+
+## D · Thresholds set from the measurement
+
+The relationship is ~20 RPS per 1% CPU, so 100% is roughly 2,000 RPS across the
+pair.
+
+| setting | value | why |
+|---|---|---|
+| `cpu_target_utilization` | 50 | The cliff between 66% and 94% is one doubling of load, and scale-out needs ~3 min of sustained breach plus ~1 min of task start. 50% (~1,000 RPS) leaves 2x margin for that reaction time; 60% leaves 1.5x. |
+| `alarm_p99_latency_seconds` | 1.0 | Healthy p99 spanned 98-306 ms at every load level; the only excursion was collapse at 3.7 s. 1.0 s sits ~3x above the worst healthy reading and ~4x below collapse. |
+| `alarm_5xx_threshold` | 10 | Zero 5XX across ~190,000 requests, *including at collapse* — the service queues rather than erroring. Any 5XX is anomalous. |
+
+---
+
+## E · Rollback — the alarm to traffic-shift chain
+
+```bash
+# load first, and leave it running
+python scripts/benchmark.py --url "http://$ALB" --mode single \
+  --processes 2 --concurrency 2 --duration 900
+
+# NOTE the image_tag. ECR is IMMUTABLE, so rebuilding an unchanged commit is
+# rejected on push and the demo dies before it starts. Passing the tag also
+# isolates the variable: identical bytes, one environment override different.
+gh workflow run deploy.yml \
+  -f image_tag=e9cbcfe6b20fa06382376253f2097c02914b08ba \
+  -f simulate_failure=runtime
+```
+
+### Timeline
+
+```
+17:56:42   canary begins routing -- first 500
+17:57-17:59  steady ~15% of requests failing
+18:00:02   HTTPCode_Target_5XX_Count alarm -> ALARM
+18:00:23   ECS rolls back; PRIMARY returns to revision 3
+18:00:30   last 500
+18:02:32   broken task set fully drained
+```
+
+ECS, in its own events:
+
+```
+(service fraud-api-prod) (deployment ecs-svc/8028...) deployment failed: alarm detected.
+(service fraud-api-prod) rolling back to deployment ecs-svc/3225...
+(service fraud-api-prod) has stopped 2 running tasks
+(service fraud-api-prod) has reached a steady state.
+```
+
+### Impact, from two independent clients
+
+| client | requests | failed | success |
+|---|---|---|---|
+| curl loop, 1/sec ([capture](evidence/e-rollback-traffic.txt)) | 900 | 27 | 96.9% |
+| benchmark, 49.8 RPS ([summary](evidence/e-rollback-load.txt)) | 44,778 | 1,343 | 97.0% |
+
+A completely broken build was deployed to production and **~97% of requests
+succeeded anyway**, with no human intervention.
+
+### The number that justifies the canary
+
+The alarm took **3m20s** to fire, not the 60 seconds the configuration implies.
+Threshold 10, one evaluation period, and ~300 5XX per minute arriving — the
+threshold was blown past almost immediately. The delay is CloudWatch ALB metric
+publication latency, and it is not tunable.
+
+That is the argument for canary with a measured cost rather than a hypothesis.
+About 190 requests passed through the 3m48s degraded window; 27 of them failed.
+Under `BLUE_GREEN` — ECS's all-at-once variant — **all ~190 would have failed**,
+because 100% of traffic moves the moment the replacement goes healthy and *then*
+you wait out the same unavoidable metric latency.
+
+So the `CANARY` vs `BLUE_GREEN` distinction is not naming pedantry. It is the
+difference between 14% and 100% of requests failing, for the same three minutes.
+
+---
+
+## The healthy path, for contrast
+
+Captured during an ordinary deployment of a good build (commit `e9cbcfe`),
+sampling `POST /predict` every 4 seconds:
+
+```
+150 requests over 10m36s
+150 x 200
+  0 x anything else
+```
+
+[Traffic capture](evidence/healthy-canary-traffic.txt) ·
+[task set samples](evidence/healthy-canary-taskssets.txt)
+
+The task set samples are the concrete form of "both sets alive": for the full
+ten minutes ECS reported
+
+```
+PRIMARY   task-definition/fraud-api-prod:3   running=2   IN_PROGRESS
+ACTIVE    task-definition/fraud-api-prod:2   running=2   COMPLETED
+```
+
+Four tasks running at once — the replacement and the original. That is why a
+rollback is a traffic shift onto tasks that are already warm rather than a fresh
+deployment: you can see the warm set sitting there.
+
+It also shows the canary working. `BLUE_GREEN` would have moved 100% the moment
+revision 3 went healthy, roughly nine minutes earlier.
+
+---
+
+## Still outstanding
+
+- Multi-AZ failover (stop a task, show the ALB serving on)
+- `simulate_failure=startup` — the other rollback shape, where traffic never
+  shifts at all
+- Autoscaling scale-out under sustained load
+- `terraform destroy` and the budget returning to zero
