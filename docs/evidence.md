@@ -155,8 +155,20 @@ for C in 2 4 8 16 32 64; do
 done
 ```
 
-2 tasks x 0.5 vCPU. CPU column is `AWS/ECS CPUUtilization`, 1-minute average —
-the same metric target tracking consumes.
+The CPU column came from this — the same metric target tracking consumes,
+published per-service without Container Insights:
+
+```bash
+aws cloudwatch get-metric-statistics --namespace AWS/ECS \
+  --metric-name CPUUtilization \
+  --dimensions Name=ClusterName,Value=fraud-api-prod \
+               Name=ServiceName,Value=fraud-api-prod \
+  --start-time "$(date -u -v-40M '+%Y-%m-%dT%H:%M:%SZ')" \
+  --end-time "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+  --period 60 --statistics Average Maximum --output table
+```
+
+2 tasks x 0.5 vCPU, CPU as 1-minute average.
 
 | in flight | RPS | p50 | p95 | p99 | CPU |
 |---|---|---|---|---|---|
@@ -184,6 +196,12 @@ core count and clock, not the deployment.
 ---
 
 ## D · Thresholds set from the measurement
+
+```bash
+# edit cpu_target_utilization / alarm_* in infra/envs/prod.tfvars, then
+terraform -chdir=infra apply -var-file=envs/prod.tfvars \
+  -var budget_notification_email=<address> -var suspend_autoscaling=true
+```
 
 The relationship is ~20 RPS per 1% CPU, so 100% is roughly 2,000 RPS across the
 pair.
@@ -261,6 +279,18 @@ difference between 14% and 100% of requests failing, for the same three minutes.
 
 ## E · The other rollback shape — and the gap it exposed
 
+```bash
+gh workflow run deploy.yml \
+  -f image_tag=e9cbcfe6b20fa06382376253f2097c02914b08ba \
+  -f simulate_failure=startup
+```
+
+> **Pass a tag that is actually in ECR.** `$(git rev-parse HEAD)` is wrong if
+> HEAD has moved to a commit CI never built — the deployment then fails with
+> `CannotPullContainerError ... not found`, which is a different failure shape
+> than the one being tested. Check with
+> `aws ecr describe-images --repository-name fraud-api-prod --query 'imageDetails[].imageTags[]'`.
+
 `simulate_failure=startup` injects `MODEL_PATH=/srv/models/does-not-exist.onnx`.
 `FraudModel.load` raises in the lifespan handler, the process exits, `/ready`
 never answers, and the replacement task set never passes its health check.
@@ -299,7 +329,32 @@ The README had claimed this path "rolls back on deployment failure". That was
 inherited from the CodeDeploy design, which had a deployment timeout, and was
 carried across the migration without re-verification. It was wrong.
 
+### Aborting a stuck deployment
+
+A deployment that will never converge has to be stopped by hand. Cancelling the
+workflow does nothing to ECS:
+
+```bash
+ARN=$(aws ecs list-service-deployments --cluster fraud-api-prod \
+        --service fraud-api-prod --query 'serviceDeployments[0].serviceDeploymentArn' \
+        --output text)
+aws ecs stop-service-deployment --service-deployment-arn "$ARN" --stop-type ROLLBACK
+```
+
+Returned the service to revision 3 at 2/2 tasks in about 45 seconds. Worth
+knowing this lever exists before needing it at 3am.
+
 ### The fix, and the confirmation
+
+```bash
+# after adding deployment_circuit_breaker to infra/ecs.tf
+terraform -chdir=infra apply -var-file=envs/prod.tfvars \
+  -var budget_notification_email=<address> -var suspend_autoscaling=true
+
+# confirm it coexists with the canary strategy
+aws ecs describe-services --cluster fraud-api-prod --services fraud-api-prod \
+  --query 'services[0].deploymentConfiguration'
+```
 
 ```hcl
 deployment_circuit_breaker {
