@@ -507,10 +507,20 @@ Fargate. The local numbers (4,120 pred/s on an M1) will not transfer to 0.5 vCPU
 on amd64, and a threshold guessed ahead of the measurement is just a number.
 
 **Autoscaling that is configured but never driven is invisible**, and
-"did you ever actually see it scale?" is a guaranteed question.
-`scripts/benchmark.py` already takes a `--url`, so pointing it at the ALB and
-holding enough load to breach the CPU target is nearly free — which is why the
-scale-out is on the evidence list rather than assumed.
+"did you ever actually see it scale?" is a guaranteed question. Driven under
+sustained load it scaled **2 → 4 tasks at +5 minutes, 4 → 6 at +11**, serving
+1,065,468 requests with zero errors — both actions attributed by Application
+Auto Scaling to the target-tracking alarm. End-to-end scale-out latency is
+~5 minutes: three of sustained breach before the alarm fires, then task start
+and health checks.
+
+Driving it also caught a bad measurement. The capacity benchmark used
+60-second runs so a scale-out could not fire mid-measurement — but
+`AWS/ECS CPUUtilization` is a **one-minute average**, so those runs ended before
+it settled and understated CPU by a third (66% reported, ~95% actual at the same
+load). A metric with an averaging window cannot be measured by a run shorter
+than that window. The full correction is in
+[`docs/evidence.md`](docs/evidence.md#f--autoscaling-actually-scaling).
 
 **The alarm thresholds are the same problem with higher stakes**, because they
 gate every deployment. Set `alarm_p99_latency_seconds` or `alarm_5xx_threshold`

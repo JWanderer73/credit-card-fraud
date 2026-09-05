@@ -170,7 +170,13 @@ aws cloudwatch get-metric-statistics --namespace AWS/ECS \
 
 2 tasks x 0.5 vCPU, CPU as 1-minute average.
 
-| in flight | RPS | p50 | p95 | p99 | CPU |
+> **The CPU column below is wrong and is kept for the record.** These runs were
+> 60 seconds; `AWS/ECS CPUUtilization` is a one-minute average and had not
+> settled. Sustained load at the same concurrency reached ~95%, not ~66% — see
+> [step F](#this-step-invalidated-step-cs-cpu-column). The RPS and latency
+> columns are unaffected.
+
+| in flight | RPS | p50 | p95 | p99 | CPU (understated) |
 |---|---|---|---|---|---|
 | 8 | 102 | 77 ms | 84 ms | 98 ms | ~3% |
 | 16 | 207 | 76 ms | 83 ms | 106 ms | ~3% |
@@ -427,10 +433,88 @@ revision 3 went healthy, roughly nine minutes earlier.
 
 ---
 
+## F · Autoscaling, actually scaling
+
+Autoscaling resumed first, then sustained load at 128 in flight — the level step
+C identified as the knee, chosen so the service is pushed well past the 50%
+setpoint without tipping into the collapse regime measured at 256.
+
+```bash
+terraform -chdir=infra apply -var-file=envs/prod.tfvars \
+  -var budget_notification_email=<address>          # resume scaling
+
+python scripts/benchmark.py --url "http://$ALB" --mode single \
+  --processes 4 --concurrency 32 --duration 780 --warmup 5
+
+aws application-autoscaling describe-scaling-activities --service-namespace ecs \
+  --query 'ScalingActivities[:4].{T:StartTime,Cause:Cause,Status:StatusCode}'
+```
+
+```
+20:52  2/2   cpu  3%    baseline
+20:54  2/2   cpu 96%    load saturating
+20:57  4/2   cpu 93%    <- scale-out #1  (+5m)
+20:58  4/4   cpu 42%    capacity landed
+21:03  6/4   cpu 61%    <- scale-out #2  (+11m)
+21:04  6/6   cpu 69%    ceiling reached, max_capacity = 6
+21:07  6/6   cpu  3%    load ends
+```
+
+**1,065,468 requests. Zero errors. 1,365 RPS, p50 78 ms, p99 354 ms** —
+including the stretch at 95% CPU
+([timeline](evidence/f-scaleout.txt) · [load summary](evidence/f-scaleout-load.txt)).
+
+Application Auto Scaling attributes both actions to
+`TargetTracking-service/fraud-api-prod/fraud-api-prod-AlarmHigh`, so the setpoint
+from step D is demonstrably what drove them. End-to-end scale-out latency was
+**~5 minutes**: three minutes of sustained breach for the target-tracking alarm,
+then task start and health checks.
+
+### This step invalidated step C's CPU column
+
+At 128 in flight, step C recorded **~66% CPU**. Sustained load at the *identical*
+concurrency reached **~95%**.
+
+`AWS/ECS CPUUtilization` is a one-minute average that lags the load producing it,
+and the step C runs were 60 seconds — they ended before the metric settled. The
+short runs were deliberate, so that a scale-out could not fire mid-measurement.
+That was the right call for the throughput numbers and the wrong one for CPU,
+and the conflict went unnoticed until this step contradicted it.
+
+Corrected: **~14 RPS per 1% CPU**, and 100% is roughly 1,400 RPS across the pair
+rather than 2,000. The 50% setpoint survives the correction — ~700 RPS still
+leaves nearly 2x headroom to collapse — but the published justification for it
+had been arithmetic on bad inputs.
+
+The lesson generalises: **a metric with an averaging window cannot be measured by
+a run shorter than that window.** Throughput stabilises in seconds; a 1-minute
+average does not.
+
+### Why it went straight to the ceiling
+
+CPU did not fall proportionally after scaling — 42-73% at 4 tasks, 56-69% at 6 —
+so the service climbed to `max_capacity` rather than settling.
+
+That is an artefact of **closed-loop load**. With a fixed 128 requests in flight,
+adding capacity does not reduce CPU; it raises throughput, because the clients
+simply go faster. Real traffic is open-loop — arrival rate is set by users, not
+by how quickly they are answered — and would have settled at 3-4 tasks.
+
+Worth stating plainly, because "it scaled to max" reads like an over-aggressive
+setpoint when it is really a property of the load generator.
+
+### Scale-in
+
+Deliberately not waited out: target tracking scales in only after **15
+consecutive minutes** below target, with a 300-second cooldown between actions.
+That asymmetry is intentional — capacity is added readily and removed
+reluctantly, because shedding too eagerly turns a traffic dip into a cold-start
+storm when it returns. It is also why this step runs last: every earlier step
+wanted a clean 2-task baseline, and reaching one from 6 tasks costs a quarter of
+an hour.
+
+---
+
 ## Still outstanding
 
-- Multi-AZ failover (stop a task, show the ALB serving on)
-- `simulate_failure=startup` — the other rollback shape, where traffic never
-  shifts at all
-- Autoscaling scale-out under sustained load
-- `terraform destroy` and the budget returning to zero
+- `terraform destroy`, and the budget confirming spend returned to zero

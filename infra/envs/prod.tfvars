@@ -21,7 +21,10 @@ desired_count = 2
 min_capacity  = 2
 max_capacity  = 6
 
-# MEASURED, not guessed. Benchmarked through the ALB at 2 tasks x 0.5 vCPU:
+# MEASURED, not guessed -- and then corrected once the measurement itself was
+# shown to be wrong.
+#
+# First pass, 60-second runs through the ALB at 2 tasks x 0.5 vCPU:
 #
 #   in flight    RPS     p50     p99      ECS CPUUtilization
 #   -------------------------------------------------------
@@ -29,11 +32,17 @@ max_capacity  = 6
 #         128   1,309    86ms   306ms     ~66%
 #         256     418*  222ms  3,692ms    ~94-100%   * collapsed
 #
-# ~20 RPS per 1% CPU, so 100% is roughly 2,000 RPS across the pair. The cliff
-# between 66% and 94% is one doubling of load, and scale-out needs ~3 minutes
-# of sustained breach plus ~1 minute of task start before new capacity lands.
-# 50% (~1,000 RPS) leaves a 2x margin to cover that reaction time; 60% leaves
-# only 1.5x, which is thinner than the cliff is steep.
+# Those CPU figures are TOO LOW. AWS/ECS CPUUtilization is a 1-minute average
+# and lags the load that produces it, so a 60-second run ends before the metric
+# settles. Sustained load at 128 in flight -- identical to the row above --
+# reached ~95%, not 66%. Corrected, the ratio is ~14 RPS per 1% CPU and 100% is
+# roughly 1,400 RPS across the pair, not 2,000.
+#
+# 50% survives the correction: ~700 RPS, which still leaves nearly 2x headroom
+# to the collapse regime, and scale-out needs ~5 minutes end to end (3 minutes
+# of sustained breach for the target-tracking alarm, plus task start) before new
+# capacity lands. Verified under sustained load: 2 -> 4 tasks at +5m, 4 -> 6 at
+# +11m, 1,065,468 requests, zero errors. See docs/evidence.md.
 cpu_target_utilization = 50
 
 log_retention_days = 7
