@@ -1,5 +1,32 @@
 # Phase 3 — AWS Deployment Plan
 
+> **This is the original plan, kept as written. It is superseded in places.**
+>
+> Phase 3 was built, run against AWS, and torn down. Several things in this
+> document turned out to be wrong or impossible, and the record of what actually
+> happened is **[`docs/evidence.md`](docs/evidence.md)**, with the design as
+> built described in the [README](README.md#aws-deployment).
+>
+> The three largest divergences:
+>
+> - **CodeDeploy could not be used.** The AWS account cannot subscribe to it
+>   (`SubscriptionRequiredException`), so the stack uses ECS-native canary
+>   deployments instead. Everything this document says about CodeDeploy
+>   applications, deployment groups, appspec files and `DEPLOYMENT_FAILURE`
+>   describes a design that was never deployed.
+> - **"Rolls back on deployment failure" was wrong for the startup case.** ECS's
+>   alarms only observe traffic that was routed, and a task set that never goes
+>   healthy receives none — so a broken startup churned for 29 minutes with no
+>   recovery. That needed `deployment_circuit_breaker`, which this plan does not
+>   mention.
+> - **The autoscaling thresholds here were guesses, and the first measurement of
+>   them was also wrong.** `AWS/ECS CPUUtilization` is a one-minute average, so
+>   the 60-second benchmark runs understated CPU by a third.
+>
+> Kept rather than rewritten because the reasoning that survived contact is more
+> useful next to the reasoning that did not.
+
+
 Detailed plan for the final phase. Phases 1–2 are complete and pushed
 (`1004e1a`, `a0505dc`). The Terraform, both workflows, the appspec and the
 verification script are **written but not yet applied against AWS** — nothing
