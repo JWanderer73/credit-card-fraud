@@ -515,6 +515,100 @@ an hour.
 
 ---
 
+## Appendix: every successful command, in execution order
+
+The sections above are organised by step. This is the flat chronological list —
+what was actually run, in the order it was run, including the recoveries. Failed
+attempts are noted where they explain the command that follows.
+
+```bash
+export AWS_REGION=us-east-1                       # CLI default is us-west-2
+
+# --- bootstrap -----------------------------------------------------------
+./scripts/bootstrap-state.sh
+terraform -chdir=infra init -backend-config=backend.hcl
+terraform -chdir=infra plan  -var-file=envs/prod.tfvars -var bootstrap=true -out=tfplan
+terraform -chdir=infra apply tfplan
+#   ^ FAILED at aws_codedeploy_app: SubscriptionRequiredException.
+#     55 of 59 resources created. Diagnosis:
+aws deploy list-applications                      # also SubscriptionRequired
+aws codebuild list-projects                       # OK -- so CodeDeploy alone
+
+# --- migrate to ECS-native (code change, see git log) ---------------------
+terraform -chdir=infra apply tfplan
+#   ^ FAILED: "advancedConfiguration field is required for all loadBalancers"
+#     caused by ignore_changes = [load_balancer] suppressing it. Fixed in ecs.tf.
+terraform -chdir=infra apply tfplan
+aws ecs describe-services --cluster fraud-api-prod --services fraud-api-prod \
+  --query 'services[0].deploymentConfiguration'
+#   ^ revealed canaryConfiguration was silently dropped under BLUE_GREEN
+aws ecs update-service --cluster fraud-api-prod --service fraud-api-prod \
+  --deployment-configuration 'strategy=CANARY,bakeTimeInMinutes=5,canaryConfiguration={canaryPercent=10,canaryBakeTimeInMinutes=5}'
+terraform -chdir=infra apply -var-file=envs/prod.tfvars -var bootstrap=true
+
+# --- first deployment ----------------------------------------------------
+gh variable set AWS_DEPLOY_ROLE_ARN \
+  --body "$(terraform -chdir=infra output -raw github_actions_role_arn)"
+git push origin main                              # CI -> Deploy
+#   ^ Deploy FAILED: Not authorized to perform sts:AssumeRoleWithWebIdentity
+aws cloudtrail lookup-events \
+  --lookup-attributes AttributeKey=EventName,AttributeValue=AssumeRoleWithWebIdentity
+#   ^ revealed the immutable subject format. Fixed in iam.tf.
+terraform -chdir=infra apply -var-file=envs/prod.tfvars -var bootstrap=true
+gh workflow run deploy.yml --ref main
+terraform -chdir=infra apply -var-file=envs/prod.tfvars   # autoscaling -> 2 tasks
+curl -s "http://$ALB/ready"
+
+# --- B: security evidence ------------------------------------------------
+./scripts/verify-deployment.sh
+aws ecs stop-task --cluster fraud-api-prod --task <one task> \
+  --reason "multi-AZ failover evidence"
+
+# --- C/D: capacity and thresholds ----------------------------------------
+terraform -chdir=infra apply -var-file=envs/prod.tfvars -var suspend_autoscaling=true
+for C in 2 4 8 16 32 64; do
+  python scripts/benchmark.py --url "http://$ALB" --mode single \
+    --processes 4 --concurrency $C --duration 60 --warmup 5
+done
+aws cloudwatch get-metric-statistics --namespace AWS/ECS --metric-name CPUUtilization \
+  --dimensions Name=ClusterName,Value=fraud-api-prod Name=ServiceName,Value=fraud-api-prod \
+  --period 60 --statistics Average Maximum
+# edit cpu_target_utilization / alarm_* in envs/prod.tfvars
+terraform -chdir=infra apply -var-file=envs/prod.tfvars -var suspend_autoscaling=true
+
+# --- E: rollback, runtime shape ------------------------------------------
+python scripts/benchmark.py --url "http://$ALB" --mode single \
+  --processes 2 --concurrency 2 --duration 900 &
+gh workflow run deploy.yml -f image_tag=<tag in ECR> -f simulate_failure=runtime
+
+# --- E: rollback, startup shape ------------------------------------------
+gh workflow run deploy.yml -f image_tag=<tag in ECR> -f simulate_failure=startup
+#   ^ first attempt passed $(git rev-parse HEAD), an unpushed commit CI never
+#     built -> CannotPullContainerError. Wrong failure shape; aborted:
+aws ecs stop-service-deployment --stop-type ROLLBACK \
+  --service-deployment-arn "$(aws ecs list-service-deployments \
+      --cluster fraud-api-prod --service fraud-api-prod \
+      --query 'serviceDeployments[0].serviceDeploymentArn' --output text)"
+#   ^ second attempt used the right tag and churned for 29 min without
+#     recovering -- the alarms cannot see an unrouted task set. Added
+#     deployment_circuit_breaker to ecs.tf, then:
+terraform -chdir=infra apply -var-file=envs/prod.tfvars -var suspend_autoscaling=true
+gh workflow run deploy.yml -f image_tag=<tag in ECR> -f simulate_failure=startup
+#   ^ rolled back automatically in 8 minutes
+
+# --- F: autoscaling ------------------------------------------------------
+terraform -chdir=infra apply -var-file=envs/prod.tfvars        # resume scaling
+python scripts/benchmark.py --url "http://$ALB" --mode single \
+  --processes 4 --concurrency 32 --duration 780 --warmup 5
+aws application-autoscaling describe-scaling-activities --service-namespace ecs
+```
+
+Every `apply` above also carried `-var budget_notification_email=<address>`,
+omitted here for width. Leaving it off any single apply silently drops the
+budget notification — Terraform has no memory of a `-var` between runs.
+
+---
+
 ## Still outstanding
 
 - `terraform destroy`, and the budget confirming spend returned to zero
