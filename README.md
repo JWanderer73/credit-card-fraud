@@ -734,39 +734,139 @@ arbitrary**. Two constraints drive it:
 `min_capacity`, so the service holds at two tasks rather than draining.
 Flipping it is a single-resource apply.
 
-#### A · Stand it up
+#### A · Stand it up — verified
 
-The four steps under [Deploying it](#deploying-it). Capture the `plan` and
-`apply` output — it is evidence item one, and it is what makes "one `apply`
-away from standing this up again" checkable rather than asserted.
+Every command below was run against a real account; the notes are what actually
+happened, not what was expected to.
+
+```bash
+export AWS_REGION=us-east-1
+
+# 1. state bucket + infra/backend.hcl (once per account)
+./scripts/bootstrap-state.sh
+terraform -chdir=infra init -backend-config=backend.hcl
+
+# 2. first apply -- empty service, nothing to pull yet
+terraform -chdir=infra apply -var-file=envs/prod.tfvars \
+  -var bootstrap=true -var budget_notification_email=you@example.com
+
+# 3. hand the deploy role to GitHub
+gh variable set AWS_DEPLOY_ROLE_ARN \
+  --body "$(terraform -chdir=infra output -raw github_actions_role_arn)"
+
+# 4. build, push and deploy a real image
+#    a push to main does this automatically via CI -> Deploy; this is the
+#    manual equivalent
+gh workflow run deploy.yml --ref main
+gh run watch "$(gh run list --workflow=deploy.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+
+# 5. second apply -- autoscaling appears and fills the service to 2 tasks
+terraform -chdir=infra apply -var-file=envs/prod.tfvars \
+  -var budget_notification_email=you@example.com
+
+# 6. confirm
+ALB=$(terraform -chdir=infra output -raw alb_dns_name)
+curl -s "http://$ALB/ready"
+```
+
+Three things worth knowing before you run it:
+
+**Step 2 must be `bootstrap=true`.** `image_tag` defaults to `bootstrap`
+against an empty, `IMMUTABLE` repository, so a normal first apply creates a
+service at `desired_count = 2` whose tasks can never pull an image — it churns
+failed launches until the first workflow run pushes a real SHA. `bootstrap=true`
+starts at zero tasks and skips the autoscaling target, which would otherwise
+drag it straight back up to its floor.
+
+**Step 5 is what raises the service, and it has to be.** `desired_count` is in
+the service's `ignore_changes` list because Application Auto Scaling owns it, so
+`min_capacity` is what fills the service to two tasks — not Terraform. In
+practice it took about 25 seconds from apply to `runningCount: 2`.
+
+**A deployment against a 0-task service is fine.** ECS accepts it, registers the
+new task definition and promotes it; there is simply nothing to shift traffic
+between yet. The smoke test in `deploy.yml` detects `desiredCount == 0` and
+skips rather than failing.
+
+#### The OIDC subject format — budget an hour for this one
+
+The deploy will fail its first run with:
+
+```
+Not authorized to perform sts:AssumeRoleWithWebIdentity
+```
+
+even with a trust policy written exactly as AWS and GitHub document it. GitHub
+now issues an **immutable subject** carrying numeric owner and repository IDs,
+so that renaming an account cannot hand its trust to whoever claims the freed-up
+name:
+
+```
+documented:  repo:OWNER/NAME:ref:refs/heads/main
+actual:      repo:OWNER@184721915/NAME@1356551646:ref:refs/heads/main
+```
+
+An exact `StringEquals` on the documented form matches nothing, and the error
+names neither the expected nor the received subject. **The received subject is
+only visible in CloudTrail** — this is the command that turns it from guesswork
+into a two-minute fix:
+
+```bash
+aws cloudtrail lookup-events --region us-east-1 \
+  --lookup-attributes AttributeKey=EventName,AttributeValue=AssumeRoleWithWebIdentity \
+  --max-results 5 --query 'Events[].CloudTrailEvent' --output text \
+  | python3 -c "import sys,json; [print(json.loads(l)['userIdentity'].get('userName')) for l in sys.stdin.read().split(chr(9)) if l.strip()]"
+```
+
+[`iam.tf`](infra/iam.tf) matches both forms with `StringLike`, wildcarding only
+the ID segments — still this owner, this repository, this branch.
 
 #### B · Security evidence — no load required
 
 ```bash
-./scripts/verify-deployment.sh
-```
-
-Then multi-AZ failover by hand: stop one task and watch the ALB keep serving
-from the other AZ while ECS replaces it.
-
-```bash
+export AWS_REGION=us-east-1
+ALB=$(terraform -chdir=infra output -raw alb_dns_name)
 CLUSTER=$(terraform -chdir=infra output -raw ecs_cluster_name)
 SERVICE=$(terraform -chdir=infra output -raw ecs_service_name)
+
+# every security claim in this README, asserted against the live account
+./scripts/verify-deployment.sh
+
+# multi-AZ failover: kill a task, watch the ALB serve from the other AZ
+# while ECS replaces it
 aws ecs stop-task --cluster "$CLUSTER" \
   --task "$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" \
             --query 'taskArns[0]' --output text)" \
-  --reason "multi-AZ failover evidence"
+  --reason "multi-AZ failover evidence" >/dev/null
+
+# run this in another terminal FIRST -- the point is that it never stops
+while true; do curl -s -o /dev/null -w '%{http_code} ' "http://$ALB/ready"; sleep 1; done
 ```
+
+The failover shot is the curl loop: an unbroken wall of `200`s while one of the
+two tasks is killed and replaced. Capture the ECS events alongside it —
+`aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --query
+'services[0].events[:5].message'` — so the recording shows the task actually
+died rather than just asserting it did.
 
 #### C · Measure per-task capacity
 
 ```bash
-terraform -chdir=infra apply -var-file=envs/prod.tfvars -var suspend_autoscaling=true
+terraform -chdir=infra apply -var-file=envs/prod.tfvars \
+  -var budget_notification_email=you@example.com \
+  -var suspend_autoscaling=true
 
 ALB=$(terraform -chdir=infra output -raw alb_dns_name)
+
+# raise concurrency until the two tasks saturate; keep each run short
 python scripts/benchmark.py --url "http://$ALB" --mode single \
-  --processes 4 --concurrency 4 --duration 90
+  --processes 4 --concurrency 4 --duration 90 --json-out bench-c4.json
+python scripts/benchmark.py --url "http://$ALB" --mode single \
+  --processes 4 --concurrency 8 --duration 90 --json-out bench-c8.json
 ```
+
+Pass `budget_notification_email` on **every** apply from here on, or the budget
+notification is dropped and re-created on the next one that includes it.
 
 Raise concurrency until the two tasks saturate. This is the first number
 measured against real infrastructure rather than localhost — report it next to
@@ -780,8 +880,15 @@ unsuspended — the suspension is belt-and-braces here, and load-bearing in E.
 
 #### D · Set the thresholds from what you measured
 
-`cpu_target_utilization`, `alarm_p99_latency_seconds` and
-`alarm_5xx_threshold` in `envs/prod.tfvars`, then apply — still suspended.
+Edit `cpu_target_utilization`, `alarm_p99_latency_seconds` and
+`alarm_5xx_threshold` in `envs/prod.tfvars` from the numbers step C produced,
+then:
+
+```bash
+terraform -chdir=infra apply -var-file=envs/prod.tfvars \
+  -var budget_notification_email=you@example.com \
+  -var suspend_autoscaling=true
+```
 
 This is the step that is easy to skip and expensive to skip. Until it is done
 those values are guesses: too tight and every deployment in step E rolls itself
@@ -816,7 +923,9 @@ done
 ```
 
 ```bash
+# terminal 3
 gh workflow run deploy.yml -f simulate_failure=runtime
+gh run watch "$(gh run list --workflow=deploy.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
 ```
 
 The shot worth capturing is terminal 2: a wall of `200`s, then a minute or two
@@ -829,12 +938,18 @@ Then the other path, which needs no load at all because traffic never shifts:
 
 ```bash
 gh workflow run deploy.yml -f simulate_failure=startup
+gh run watch "$(gh run list --workflow=deploy.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+
+# then put the good build back
+gh workflow run deploy.yml
 ```
 
 #### F · Autoscaling, actually scaling
 
 ```bash
-terraform -chdir=infra apply -var-file=envs/prod.tfvars   # resume
+# resume scaling
+terraform -chdir=infra apply -var-file=envs/prod.tfvars \
+  -var budget_notification_email=you@example.com
 
 python scripts/benchmark.py --url "http://$ALB" --mode single \
   --processes 4 --concurrency 8 --duration 900
@@ -855,13 +970,23 @@ capture the scale-in tail if it is convenient, or note it and tear down.
 
 #### G · Tear down
 
-CloudWatch logs and the alarms back in `OK`, then:
-
 ```bash
-terraform -chdir=infra destroy -var-file=envs/prod.tfvars
+# logs and alarms are part of the evidence -- capture before destroying
+aws logs describe-log-streams --log-group-name /ecs/fraud-api-prod \
+  --order-by LastEventTime --descending --max-items 3
+aws cloudwatch describe-alarms --alarm-name-prefix fraud-api-prod \
+  --query 'MetricAlarms[].{Alarm:AlarmName,State:StateValue}' --output table
+
+terraform -chdir=infra destroy -var-file=envs/prod.tfvars \
+  -var budget_notification_email=you@example.com
+
+# what survives on purpose: the state bucket (outside Terraform) and this repo
+aws s3 ls | grep tfstate
 ```
 
-and the budget confirming spend returned to zero.
+Then the budget confirming spend returned to zero. **`destroy` is the step that
+matters most** — the ALB and the six interface-endpoint ENIs are what accrue
+cost, and the stack is designed to be stood back up with one `apply`.
 
 ### Cost and teardown
 

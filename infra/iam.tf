@@ -17,6 +17,9 @@ locals {
 
   ecs_service_arn = "arn:${local.partition}:ecs:${local.region}:${local.account_id}:service/${aws_ecs_cluster.main.name}/${aws_ecs_service.app.name}"
 
+  github_owner     = split("/", var.github_repo)[0]
+  github_repo_name = split("/", var.github_repo)[1]
+
   oidc_provider_arn = var.create_github_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : data.aws_iam_openid_connect_provider.github[0].arn
 }
 
@@ -71,12 +74,36 @@ data "aws_iam_policy_document" "github_actions_trust" {
     # `repo:owner/name:*` is the version that appears in most tutorials, and it
     # is a real hole: any branch, and any pull request from a fork that manages
     # to run a workflow, would be able to assume a role that can push images to
-    # ECR and start production deployments. The exact-match sub below admits
-    # pushes to main and nothing else.
+    # ECR and start production deployments. Both patterns below pin the branch.
+    #
+    # TWO patterns, because GitHub has two subject formats and this cost a
+    # failed deployment to discover. The documented-everywhere form is
+    #
+    #   repo:OWNER/NAME:ref:refs/heads/main
+    #
+    # but GitHub now issues an IMMUTABLE subject that carries the numeric owner
+    # and repository IDs:
+    #
+    #   repo:OWNER@184721915/NAME@1356551646:ref:refs/heads/main
+    #
+    # The point of the IDs is that renaming an account or repository cannot
+    # hand its trust to whoever claims the freed-up name. An exact StringEquals
+    # on the documented form simply does not match, and the failure surfaces as
+    # a bare "Not authorized to perform sts:AssumeRoleWithWebIdentity" with no
+    # hint as to why -- the actual subject is only visible in CloudTrail's
+    # AssumeRoleWithWebIdentity event.
+    #
+    # Matching both keeps this correct whether or not the immutable format is
+    # in force. The wildcards cover only the ID segments, so this is exactly as
+    # strong as the documented form: it still demands this owner login, this
+    # repository name, and this branch.
     condition {
-      test     = "StringEquals"
+      test     = "StringLike"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repo}:ref:refs/heads/${var.github_branch}"]
+      values = [
+        "repo:${var.github_repo}:ref:refs/heads/${var.github_branch}",
+        "repo:${local.github_owner}@*/${local.github_repo_name}@*:ref:refs/heads/${var.github_branch}",
+      ]
     }
   }
 }

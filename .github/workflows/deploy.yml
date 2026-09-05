@@ -254,15 +254,39 @@ jobs:
           service: ${{ env.ECS_SERVICE }}
           wait-for-service-stability: true
 
+      # Deliberately conditional on the service actually having tasks.
+      #
+      # During bootstrap the service sits at desiredCount 0: a deployment still
+      # registers the new task definition and promotes it, but nothing is
+      # serving, so the ALB correctly answers with its fixed-response 503
+      # default. Failing the run there reports a successful deployment as
+      # broken -- and worse, trains you to ignore a red smoke test, which is
+      # the one signal that should never be noise.
+      #
+      # When tasks DO exist this stays strict: a non-200 fails the workflow.
       - name: Smoke-test through the load balancer
         run: |
           set -euo pipefail
+
+          DESIRED=$(aws ecs describe-services \
+                      --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+                      --query 'services[0].desiredCount' --output text)
           DNS=$(aws elbv2 describe-load-balancers \
                   --names "$ALB_NAME" \
                   --query 'LoadBalancers[0].DNSName' --output text)
-          echo "ALB: http://${DNS}"
-          curl -fsS --retry 5 --retry-delay 3 --retry-all-errors "http://${DNS}/ready"
+          echo "ALB: http://${DNS}  (desiredCount=${DESIRED})"
+
+          {
+            echo "### Deployed \`${{ steps.image.outputs.uri }}\`"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$DESIRED" = "0" ]; then
+            echo "::notice::Service desiredCount is 0 (bootstrap): the task definition was registered and promoted, but nothing serves traffic yet. Skipping the smoke test."
+            echo "Task definition registered and promoted. Service is at 0 tasks (bootstrap), so no smoke test was run." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          curl -fsS --retry 5 --retry-delay 5 --retry-all-errors "http://${DNS}/ready"
           echo
-          echo "### Deployed \`${{ steps.image.outputs.uri }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "http://${DNS}/docs" >> "$GITHUB_STEP_SUMMARY"
